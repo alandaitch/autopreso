@@ -400,6 +400,10 @@ export async function runWhiteboardAgent({ transcript, state, wss, options, gene
     model: createWhiteboardAgentModel(agentProvider),
     providerOptions: createWhiteboardAgentProviderOptions(agentProvider, effectiveSystem),
     stopWhen: stepCountIs(4),
+    // If the queue cancels this turn (because a fresher transcript arrived
+    // before we drew anything), the SDK aborts the in-flight model call and
+    // throws AbortError. The caller in whiteboard-session catches it.
+    abortSignal: options.abortSignal,
     system: effectiveSystem,
     messages,
     tools: {
@@ -415,6 +419,9 @@ export async function runWhiteboardAgent({ transcript, state, wss, options, gene
           state.elements = normalizedElements;
           state.canvasDirtyForAgent = true;
           broadcast(wss, { type: "whiteboard:update", elements: normalizedElements });
+          // The audience now sees agent output for this turn; the queue must
+          // not cancel us anymore (no starvation under continuous speech).
+          options.onRendered?.();
           const result = appendLayoutWarnings(formatLineNumberedWhiteboard(normalizedElements), normalizedElements);
           dumpToolCall("whiteboard_overwrite", { elementCount: elements.length, ids: elements.map((el) => el.id) }, normalizedElements.map((el) => el.id), result);
           options.onAgentEvent?.({ type: "tool:end", tool: "whiteboard_overwrite", result, elements: normalizedElements, timestamp: new Date().toISOString() });
@@ -448,6 +455,10 @@ export async function runWhiteboardAgent({ transcript, state, wss, options, gene
             state.elements = nextElements;
             state.canvasDirtyForAgent = true;
             broadcast(wss, { type: "whiteboard:update", elements: nextElements });
+            // First visible draw of this turn — disable the queue's cancel
+            // window so subsequent transcript chunks queue normally instead
+            // of aborting us mid-edit.
+            options.onRendered?.();
             canvasResult = appendLayoutWarnings(formatLineNumberedWhiteboard(nextElements), nextElements);
           }
 
@@ -1051,11 +1062,42 @@ For color and visual hierarchy:
 - Never assign a different color to each shape just to differentiate them. Position, label, and shape type already differentiate them.
 - The center or origin node of a hub-and-spoke, the conclusion of a flow, or the "headline" concept should get the accent color. Supporting nodes share the neutral color.
 
-For icons and visual interest, use Unicode emojis as inline icons:
-- A single well-chosen emoji at the start of a label or as a standalone marker reads as a clean icon and adds far more polish than another rectangle. Examples: 💡 idea/insight, 🎯 goal/target, 📊 metric/data, ⚠️ risk/warning, ✅ confirmed/done, ❌ blocker/no, ⚙️ system/process, 🚀 launch/release, 🧩 component/module, 🔑 key concept, 🧠 reasoning/AI, 🏷️ label/tag, 📅 date/timeline, 🔗 link/dependency, 💰 cost/revenue, 👥 users/team, 🌐 web/network.
-- Prefer the emoji over writing a redundant word: "💡 Insight" > "[icon] Insight: ...". One emoji per shape max; emojis are accents, not decoration.
-- For the "headline" / accent shape, an emoji works well as a focal indicator.
-- Skip emojis when they would clutter or when the talk is formal/technical and they would feel jarring.
+For icons, prefer Lucide vector icons over emoji. Lucide is a clean line-icon
+set that renders consistently at any size and adopts the canvas color scheme.
+To place a Lucide icon, emit an element with this shape:
+
+  { "id": "<unique>", "type": "rectangle", "x": <px>, "y": <px>,
+    "width": 48, "height": 48,
+    "customData": { "iconLib": "lucide", "iconName": "<name>" } }
+
+The frontend swaps it for the SVG once loaded. Width/height define the icon
+box; 32-64 px reads well next to a label, 80-120 px works as a standalone
+focal marker. The element type field is just a placeholder before the swap;
+"rectangle" is fine.
+
+Pre-loaded names (instant, never miss): lightbulb, brain, sparkles, star,
+target, flag, trophy, check, check-circle, x, x-circle, circle-alert,
+triangle-alert, info, play, pause, rocket, send, zap, bolt, wrench,
+chart-bar, chart-line, chart-pie, trending-up, trending-down, calculator,
+settings, cpu, database, server, code, terminal, git-branch, globe, user,
+users, user-check, shield, key, lock, dollar-sign, credit-card, shopping-cart,
+clock, calendar, calendar-clock, timer, mail, message-square, phone, share-2,
+link, external-link, file-text, file-code, folder, image, arrow-right,
+arrow-up, arrow-down, arrow-left, puzzle, tag, bookmark, search, filter,
+eye, heart.
+
+For other concepts, use any valid Lucide icon name in kebab-case
+(https://lucide.dev). Lucide naming is predictable: chart-{bar,line,pie},
+arrow-{up,down,left,right}, file-{text,code,image}, alert-{circle,triangle,
+octagon}. The icon is fetched on demand the first time it's used and silently
+dropped if the name doesn't exist — only request names you're confident about.
+
+Use icons sparingly, the same way you'd use color: one per shape max, and
+only when the icon adds meaning beyond what the label already says. Skip
+them when the talk is formal/technical and they would feel jarring.
+
+Unicode emojis (💡 🎯 📊 etc.) still work as inline label characters when a
+quick affective marker is more natural than a vector icon. Use whichever fits.
 
 For text and labels:
 - ALWAYS use a shape's "label" field for any text that belongs INSIDE a shape (node names, card titles, button labels, anything inside a rectangle/ellipse/diamond). NEVER place a standalone "text" element on top of or overlapping a shape - Excalidraw renders standalone text by literal coordinates with no auto-centering or wrapping, so it will bleed outside the shape and look broken. Use the shape's label and Excalidraw will center and wrap correctly.

@@ -1,4 +1,15 @@
-export function createTranscriptTurnQueue({ runTurn, debounceMs = 150, isReady = (_text) => true }) {
+export function createTranscriptTurnQueue({
+  runTurn,
+  debounceMs = 150,
+  isReady = (_text) => true,
+  // Optional: when a new ready chunk arrives while a turn is in flight, the
+  // queue calls cancelInflight(nextText). If it returns true, the caller is
+  // expected to abort the in-flight turn ASAP; we still buffer the new text so
+  // the post-cancel drain picks it up. Returning false (default) preserves the
+  // original semantics — the in-flight turn runs to completion and the next
+  // text waits in `buffered`.
+  cancelInflight = null,
+}) {
   let running = false;
   let buffered = [];
   let current = Promise.resolve();
@@ -22,6 +33,13 @@ export function createTranscriptTurnQueue({ runTurn, debounceMs = 150, isReady =
     pending = [];
     if (running) {
       buffered.push(text);
+      // Try to cancel the in-flight turn so the agent re-runs with the freshest
+      // context instead of finishing on stale input. The actual abort happens
+      // inside cancelInflight; the runTurn promise will reject/resolve and the
+      // existing drain() loop picks up `buffered` to start the next turn.
+      if (typeof cancelInflight === "function") {
+        try { cancelInflight(text); } catch { /* swallow */ }
+      }
     } else {
       current = drain(text);
     }

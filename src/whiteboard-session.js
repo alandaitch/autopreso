@@ -73,6 +73,16 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
     broadcast(wss, { type: "agent:status", status });
   }
 
+  // Per-turn cancellation guard. We only abort an in-flight turn if it hasn't
+  // produced any visible canvas output yet — otherwise interrupting it would
+  // cause starvation under continuous speech (each new chunk would kill the
+  // previous turn before it ever finished). With this guard, the audience
+  // always sees the first draw; only the model's pre-tool "thinking" latency
+  // is interruptible, which is exactly when re-rolling with fresh context is
+  // most useful.
+  let currentAbortController = null;
+  let currentTurnHasRendered = false;
+
   const queue = createTranscriptTurnQueue({
     // No queue-level debounce: turn boundaries are decided upstream by the
     // transcription provider (delta-quiet for OpenAI; per-chunk commits for
@@ -84,6 +94,12 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
     // accumulating until the speaker says something real, then fire as one
     // combined turn ("uh\num\nOpenAI just released...").
     isReady: (text) => !isTrivialTranscript(text),
+    cancelInflight: () => {
+      if (currentTurnHasRendered) return false;
+      if (!currentAbortController) return false;
+      currentAbortController.abort();
+      return true;
+    },
     runTurn: async (transcript) => {
       if (state.mode !== "live") return;
       // Capture the session at the moment the turn begins. If endSession()
@@ -97,15 +113,35 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
       if (!mySession.active) return;
       state.agentBusy = true;
       publishAgentStatus();
+      currentAbortController = new AbortController();
+      currentTurnHasRendered = false;
+      const turnAbortSignal = currentAbortController.signal;
+      const markRendered = () => { currentTurnHasRendered = true; };
       options.onAgentEvent?.({ type: "turn:start", transcript, timestamp: new Date().toISOString() });
       try {
-        await runAgent({ transcript, state, wss, options });
+        await runAgent({
+          transcript,
+          state,
+          wss,
+          options: { ...options, abortSignal: turnAbortSignal, onRendered: markRendered },
+        });
         options.onAgentEvent?.({ type: "turn:end", transcript, timestamp: new Date().toISOString() });
       } catch (error) {
-        console.error("Whiteboard agent failed:", error);
-        broadcast(wss, { type: "error", message: `Whiteboard agent failed: ${error.message}` });
-        options.onAgentEvent?.({ type: "turn:error", transcript, error: error.message, timestamp: new Date().toISOString() });
+        // Cancellation is intentional (a fresher transcript made this turn
+        // stale); don't surface as an error to the user.
+        const aborted =
+          error?.name === "AbortError" ||
+          error?.cause?.name === "AbortError" ||
+          turnAbortSignal.aborted;
+        if (aborted) {
+          options.onAgentEvent?.({ type: "turn:cancelled", transcript, timestamp: new Date().toISOString() });
+        } else {
+          console.error("Whiteboard agent failed:", error);
+          broadcast(wss, { type: "error", message: `Whiteboard agent failed: ${error.message}` });
+          options.onAgentEvent?.({ type: "turn:error", transcript, error: error.message, timestamp: new Date().toISOString() });
+        }
       } finally {
+        currentAbortController = null;
         state.agentBusy = false;
         publishAgentStatus();
       }

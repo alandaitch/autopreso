@@ -7,6 +7,12 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 
 import { STARTER_ELEMENTS } from "./starter-elements.js";
+import {
+  attachIconRegistry,
+  ensureIconLoaded,
+  getCachedIconFileId,
+  preloadLucideWhitelist,
+} from "./lucide-icons.js";
 
 const SAMPLE_RATE = 24000;
 const REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh"];
@@ -103,6 +109,50 @@ const TYPEWRITER_CURSOR = "│";
 const TYPEWRITER_CURSOR_BLINK_MS = 500;
 
 const STARTER_STAGING_ELEMENTS = [];
+
+// Convert agent-emitted icon placeholders into Excalidraw image elements.
+// The agent emits something like:
+//   { id, type: "rectangle", x, y, width, height, customData: { iconLib: "lucide", iconName: "lightbulb" } }
+// (rectangle is just a benign placeholder type — width/height define the icon
+// box.) We swap to type:"image" once the SVG file is registered. While the
+// fetch is in flight we leave the placeholder shape on screen — when the icon
+// lands, attachIconRegistry's onIconReady triggers a re-render that swaps it.
+function resolveLucideIcons(elements) {
+  if (!Array.isArray(elements)) return elements;
+  let touched = false;
+  const out = elements.map((el) => {
+    const lib = el.customData?.iconLib;
+    const name = el.customData?.iconName;
+    if (lib !== "lucide" || typeof name !== "string") return el;
+    const fileId = getCachedIconFileId(name);
+    if (fileId === undefined) {
+      // Not yet fetched — kick the load and keep the placeholder for now.
+      ensureIconLoaded(name);
+      return el;
+    }
+    if (fileId === null) {
+      // Negative cache: silently drop the icon (render as an invisible
+      // 0-opacity placeholder rather than removing the element entirely so
+      // the agent's element ids stay valid for subsequent ops).
+      touched = true;
+      return { ...el, opacity: 0 };
+    }
+    // Positive cache: swap to an image element using the registered fileId.
+    touched = true;
+    return {
+      ...el,
+      type: "image",
+      fileId,
+      status: "saved",
+      scale: el.scale ?? [1, 1],
+      // Drop fields that don't apply to images so Excalidraw doesn't complain.
+      strokeColor: undefined,
+      backgroundColor: undefined,
+      fillStyle: undefined,
+    };
+  });
+  return touched ? out : elements;
+}
 
 function commonPrefixLen(a, b) {
   const max = Math.min(a.length, b.length);
@@ -258,6 +308,17 @@ function App() {
 
   React.useEffect(() => {
     apiRef.current = api;
+    if (!api) return;
+    // Register the API with the icon resolver and kick off the whitelist
+    // preload. Late-arriving icons trigger a re-render via onIconReady.
+    attachIconRegistry(api, (_name, _fileId) => {
+      // Re-apply current scene so the freshly-loaded icon swaps in.
+      const current = api.getSceneElements();
+      if (!current) return;
+      const resolved = resolveLucideIcons(current);
+      api.updateScene({ elements: resolved });
+    });
+    preloadLucideWhitelist();
   }, [api]);
 
   React.useEffect(() => {
@@ -687,6 +748,9 @@ function App() {
     let renderable = looksNative
       ? elements
       : convertToExcalidrawElements(elements, { regenerateIds: false });
+    // Resolve icon placeholders to image elements (registers any uncached
+    // SVGs in the background; cached ones swap synchronously).
+    renderable = resolveLucideIcons(renderable);
     // Apply user-selected palette / font as a client-side override before render.
     // "auto" palette is a no-op (passes the agent's own colors through).
     const presentation = settingsRef.current?.presentation;
@@ -768,7 +832,6 @@ function App() {
     requestAnimationFrame(() => {
       api.scrollToContent(newElements, {
         animate: true,
-        fitToContent: true,
         viewportZoomFactor,
       });
     });

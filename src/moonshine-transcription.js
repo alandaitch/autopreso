@@ -137,11 +137,14 @@ export function createMoonshineTranscription({
 
     // EPIPE on stdin is expected if the child died between our last write and now.
     // Swallow it — the close handler below already surfaces the underlying error.
-    child.stdin.on("error", (error) => {
-      if (/** @type {NodeJS.ErrnoException} */ (error).code !== "EPIPE") {
-        sendTranscript({ type: "error", message: error.message });
-      }
-    });
+    // (Defensive .on call: tests mock stdin as a plain object without EventEmitter.)
+    if (typeof child.stdin?.on === "function") {
+      child.stdin.on("error", (error) => {
+        if (/** @type {NodeJS.ErrnoException} */ (error).code !== "EPIPE") {
+          sendTranscript({ type: "error", message: error.message });
+        }
+      });
+    }
 
     child.stdout.on("data", (chunk) => {
       stdoutBuffer += chunk.toString("utf8");
