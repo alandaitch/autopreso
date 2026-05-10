@@ -228,6 +228,31 @@ function App() {
     settingsRef.current = settings;
   }, [settings]);
 
+  // Re-apply palette / font retroactively to whatever's already on the canvas
+  // when the user changes those settings. Without this, only future agent
+  // updates would pick up the new style. We bump versionNonce on touched
+  // elements so Excalidraw invalidates its render cache; we don't touch
+  // opacity / position / type so the user sees a clean repaint, not movement.
+  // Note: switching palette to "auto" doesn't roll back previous overrides —
+  // the agent would need to redraw to restore its own colors.
+  React.useEffect(() => {
+    const api = apiRef.current;
+    if (!api || !settings?.presentation) return;
+    const current = api.getSceneElements();
+    if (!current || current.length === 0) return;
+    const restyled = applyPresentationStyle(current, settings.presentation);
+    if (restyled === current) return;
+    const bumped = restyled.map((el, i) => {
+      if (el === current[i]) return el;
+      return {
+        ...el,
+        version: (el.version ?? 1) + 1,
+        versionNonce: (Math.random() * 0x7fffffff) | 0,
+      };
+    });
+    api.updateScene({ elements: bumped });
+  }, [settings?.presentation?.palette, settings?.presentation?.fontFamily]);
+
   React.useEffect(() => {
     return () => {
       clearTimeout(screenshotTimerRef.current);
