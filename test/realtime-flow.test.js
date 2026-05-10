@@ -256,9 +256,38 @@ test("realtime: cancelled turn's words are re-merged into the next turn (not los
   }
 });
 
-test("realtime: in-flight turn IS cancelled when nothing has drawn yet", async () => {
-  // Agent takes 200ms before drawing, but never draws (returns text only).
-  // When a fresh transcript arrives 50ms in, the old turn should abort.
+test("realtime: a model that returned DONE quickly (no draw) does NOT get retroactively cancelled", async () => {
+  // Without onModelReturned locking the turn in, a fast no-draw turn followed
+  // immediately by a fresh chunk would be aborted post-hoc, the cancelled-text
+  // recovery would re-prepend its transcript, and we'd grow an endless
+  // super-turn instead of letting each chunk run as its own turn.
+  // Model returns at 30ms; chunk 2 arrives at 60ms. Second turn must see ONLY
+  // "second" — the first turn is finished, no merge.
+  const seen = [];
+  let counter = 0;
+  const drawingFn = async ({ messages }) => {
+    counter += 1;
+    seen.push({ id: counter, transcript: extractSpeakerTurn(messages) });
+    await new Promise((r) => setTimeout(r, 30));
+    return { text: "DONE", finishReason: "stop" };
+  };
+  const hMid = await harness({ generateTextFn: drawingFn });
+  try {
+    hMid.fake.feedTranscript("first");
+    await new Promise((r) => setTimeout(r, 60));
+    hMid.fake.feedTranscript("second");
+    await hMid.state.idle();
+    const second = seen.find((s) => s.id === 2);
+    assert.ok(second, `expected a second turn, got: ${JSON.stringify(seen)}`);
+    assert.equal(second.transcript, "second", `second turn should see only 'second' (got: ${JSON.stringify(second.transcript)})`);
+  } finally {
+    await hMid.close();
+  }
+});
+
+test("realtime: in-flight turn IS cancelled while the model is still thinking", async () => {
+  // Agent stalls 200ms before returning; chunk 2 arrives at 50ms. That's
+  // squarely inside the model-thinking window where cancellation is useful.
   const aborts = [];
   const fn = async ({ messages, abortSignal }) => {
     const t = extractSpeakerTurn(messages);

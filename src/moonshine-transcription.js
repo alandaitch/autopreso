@@ -6,16 +6,16 @@ const require = createRequire(import.meta.url);
 const SAMPLE_RATE = 24000;
 // If the rolling partial transcript hasn't grown for this long, treat it as
 // a turn even if Moonshine itself hasn't emitted `transcript:committed` yet.
-// Without this, the agent only acts on the model's natural utterance breaks
-// (which require ~1s of silence), and continuous speech never triggers it.
-const DEFAULT_PARTIAL_QUIET_MS = 700;
-// Continuous speech caps. Without these, a long monologue accumulates into one
-// huge turn and the agent has nothing on screen until the speaker finally pauses.
-// Flushing on either threshold keeps the canvas reactive (~every 4s or 12 words);
-// the agent is built to refine prior elements on the next turn, so a partially
-// transcribed first turn is fine — it gets corrected as more arrives.
-const DEFAULT_MAX_PARTIAL_WORDS = 12;
-const DEFAULT_MAX_PARTIAL_MS = 4000;
+// 1000ms is roughly the natural inter-utterance pause and matches OpenAI
+// Realtime's delta-quiet default. Lower values cause too-frequent micro-turns
+// that the model can't draw on; higher values delay the first visual.
+const DEFAULT_PARTIAL_QUIET_MS = 1000;
+// Continuous speech caps. Each chunk should carry enough words for the model
+// to confidently extract a concept and draw it. 18 words ≈ 4-6 seconds of
+// natural speech — a full sentence or two, enough to commit to a layout.
+// 6s is the upper bound: even speakers who never pause get a visual every 6s.
+const DEFAULT_MAX_PARTIAL_WORDS = 18;
+const DEFAULT_MAX_PARTIAL_MS = 6000;
 const SIDECAR_PACKAGE_BY_PLATFORM = new Map([
   ["darwin:arm64", "@autopreso/moonshine-darwin-arm64"],
   ["darwin:x64", "@autopreso/moonshine-darwin-x64"],

@@ -73,15 +73,18 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
     broadcast(wss, { type: "agent:status", status });
   }
 
-  // Per-turn cancellation guard. We only abort an in-flight turn if it hasn't
-  // produced any visible canvas output yet — otherwise interrupting it would
-  // cause starvation under continuous speech (each new chunk would kill the
-  // previous turn before it ever finished). With this guard, the audience
-  // always sees the first draw; only the model's pre-tool "thinking" latency
-  // is interruptible, which is exactly when re-rolling with fresh context is
-  // most useful.
+  // Per-turn cancellation guard. We abort an in-flight turn only while the
+  // model is still THINKING — i.e., between turn start and either (a) a tool
+  // call that drew on the canvas or (b) the model returning at all (even
+  // returning DONE with no draw). This catches the useful case ("the model
+  // is taking a while; let's reroll with fresher context") while avoiding
+  // two failure modes:
+  //   1. Starvation under continuous speech — once any output exists, lock in.
+  //   2. Cancel-thrash when the model answers "no draw" fast — a quick DONE
+  //      should still close the cancel window so the next chunk runs as its
+  //      own turn instead of merging endlessly into a growing super-turn.
   let currentAbortController = null;
-  let currentTurnHasRendered = false;
+  let currentTurnLockedIn = false;
 
   const queue = createTranscriptTurnQueue({
     // No queue-level debounce: turn boundaries are decided upstream by the
@@ -95,7 +98,7 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
     // combined turn ("uh\num\nOpenAI just released...").
     isReady: (text) => !isTrivialTranscript(text),
     cancelInflight: () => {
-      if (currentTurnHasRendered) return false;
+      if (currentTurnLockedIn) return false;
       if (!currentAbortController) return false;
       currentAbortController.abort();
       return true;
@@ -114,16 +117,21 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
       state.agentBusy = true;
       publishAgentStatus();
       currentAbortController = new AbortController();
-      currentTurnHasRendered = false;
+      currentTurnLockedIn = false;
       const turnAbortSignal = currentAbortController.signal;
-      const markRendered = () => { currentTurnHasRendered = true; };
+      const lockTurn = () => { currentTurnLockedIn = true; };
       options.onAgentEvent?.({ type: "turn:start", transcript, timestamp: new Date().toISOString() });
       try {
         await runAgent({
           transcript,
           state,
           wss,
-          options: { ...options, abortSignal: turnAbortSignal, onRendered: markRendered },
+          options: {
+            ...options,
+            abortSignal: turnAbortSignal,
+            onRendered: lockTurn,       // first canvas mutation locks the turn in
+            onModelReturned: lockTurn,  // model returning (even no-draw DONE) also locks in
+          },
         });
         options.onAgentEvent?.({ type: "turn:end", transcript, timestamp: new Date().toISOString() });
       } catch (error) {
