@@ -19,6 +19,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   },
   presentation: {
     cinematicMode: true,
+    // Lower factor = closer crop. 0.85 = subtle (most of the canvas visible),
+    // 0.55 = close (frames mainly the new content). Drives scrollToContent.
+    cinematicZoom: 0.55,
+    // When true, new and edited text fields type out char-by-char with a
+    // blinking cursor instead of appearing instantly. If text changes, the
+    // animation erases back to the common prefix and types the new suffix.
+    typewriter: true,
     palette: "modern",
     // Excalifont is Excalidraw 0.18's bundled default font, so it's already
     // loaded when text first appears. Other fonts (Virgil/Helvetica/Cascadia)

@@ -87,7 +87,29 @@ const PRESENTATION_FONT_OPTIONS = Object.entries(PRESENTATION_FONTS).map(
 const CINEMATIC_TWEEN_FRAMES = 8;
 const CINEMATIC_TWEEN_FRAME_MS = 45;
 
+const CINEMATIC_ZOOM_OPTIONS = [
+  ["0.85", "Subtle (frames the area)"],
+  ["0.7", "Medium"],
+  ["0.55", "Close (focus on the new element)"],
+  ["0.4", "Extra close"],
+];
+
+// Typewriter config. ~2 chars per frame at 40ms = 50 cps ≈ comfortable reading
+// speed. Cursor blinks every 500ms while typing/erasing.
+const TYPEWRITER_FRAME_MS = 40;
+const TYPEWRITER_CHARS_PER_FRAME = 2;
+const TYPEWRITER_ERASE_CHARS_PER_FRAME = 4; // erase faster than we type — feels like a correction, not a re-draft
+const TYPEWRITER_CURSOR = "│";
+const TYPEWRITER_CURSOR_BLINK_MS = 500;
+
 const STARTER_STAGING_ELEMENTS = [];
+
+function commonPrefixLen(a, b) {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  return i;
+}
 
 function applyPresentationStyle(elements, presentation) {
   if (!presentation) return elements;
@@ -184,6 +206,20 @@ function App() {
   const settingsRef = React.useRef(null);
   const lastSceneIdsRef = React.useRef(new Set());
   const cinematicTweenRef = React.useRef(null);
+  // Typewriter state. Map of element id -> {
+  //   target: full text the element should end up showing,
+  //   displayedLen: chars currently visible (advances during typing, retreats during erasing),
+  //   eraseTo: when set, erase backward to this length before typing forward again
+  // }. The frame loop ticks every TYPEWRITER_FRAME_MS while the map is non-empty.
+  const typewriterStateRef = React.useRef(new Map());
+  // Snapshot of the latest target scene (post-style, post-cinematic) keyed by id,
+  // so the typewriter loop can reconstruct the full element with patched text on
+  // each frame without re-running applyScene logic.
+  const typewriterSceneRef = React.useRef(new Map());
+  const typewriterTimerRef = React.useRef(null);
+  // Remember each element's last fully-typed text so we can detect text changes
+  // across applyScene calls without relying on the previous scene snapshot.
+  const lastFullTextRef = React.useRef(new Map());
   const wsRef = React.useRef(null);
   const modeRef = React.useRef("staging");
   const stagingSceneRef = React.useRef(null);
@@ -261,6 +297,7 @@ function App() {
       clearTimeout(userElementsSyncTimerRef.current);
       clearTimeout(agentInstructionsSaveTimerRef.current);
       clearTimeout(cinematicTweenRef.current);
+      clearTimeout(typewriterTimerRef.current);
     };
   }, []);
 
@@ -659,14 +696,30 @@ function App() {
 
     // Cinematic mode: pan/zoom to frame newly arrived elements and fade them in.
     const cinematic = presentation?.cinematicMode !== false;
+    const typewriter = presentation?.typewriter !== false;
     const previousIds = lastSceneIdsRef.current;
     const newElements = cinematic
       ? renderable.filter((el) => el.id && !previousIds.has(el.id))
       : [];
     lastSceneIdsRef.current = new Set(renderable.map((el) => el.id));
 
+    // Typewriter: detect text fields that are new or that changed across updates.
+    // We do this BEFORE updateScene so we can patch the truncated text into the
+    // first render — otherwise the audience sees the full text flash, then the
+    // cursor jumps back to start.
+    if (typewriter) {
+      registerTypewriterTargets(renderable);
+      renderable = applyTypewriterPatches(renderable);
+      ensureTypewriterLoop();
+    } else {
+      // Disabling typewriter mid-session: cancel any active animations and
+      // make sure the next render shows the final text.
+      typewriterStateRef.current.clear();
+      cancelTypewriterLoop();
+    }
+
     if (cinematic && newElements.length > 0 && renderable.length > 0) {
-      runCinematicTransition(excalidrawAPI, renderable, newElements);
+      runCinematicTransition(excalidrawAPI, renderable, newElements, presentation);
     } else {
       excalidrawAPI.updateScene({
         elements: renderable,
@@ -683,7 +736,7 @@ function App() {
     scheduleWhiteboardScreenshot();
   }
 
-  function runCinematicTransition(api, allElements, newElements) {
+  function runCinematicTransition(api, allElements, newElements, presentation) {
     // Cancel any in-flight tween so a fresh update doesn't fight the previous one.
     if (cinematicTweenRef.current) {
       clearTimeout(cinematicTweenRef.current);
@@ -709,12 +762,14 @@ function App() {
       elements: sceneFor(0),
       appState: { viewBackgroundColor: "#fffdf8" },
     });
+    const zoomFactor = parseFloat(presentation?.cinematicZoom);
+    const viewportZoomFactor = Number.isFinite(zoomFactor) ? zoomFactor : 0.55;
     // Defer scrollToContent so updateScene flushes first; otherwise bounds are stale.
     requestAnimationFrame(() => {
       api.scrollToContent(newElements, {
         animate: true,
         fitToContent: true,
-        viewportZoomFactor: 0.85,
+        viewportZoomFactor,
       });
     });
 
@@ -730,6 +785,145 @@ function App() {
       }
     };
     cinematicTweenRef.current = setTimeout(step, CINEMATIC_TWEEN_FRAME_MS);
+  }
+
+  // ─── Typewriter effect ────────────────────────────────────────────────────
+  function registerTypewriterTargets(elements) {
+    const seenIds = new Set();
+    const lastFullText = lastFullTextRef.current;
+    const state = typewriterStateRef.current;
+    typewriterSceneRef.current = new Map(
+      elements.map((el) => [el.id, el]),
+    );
+    for (const el of elements) {
+      if (el.type !== "text") continue;
+      const target = typeof el.text === "string" ? el.text : "";
+      if (!target) continue;
+      seenIds.add(el.id);
+      const previousFull = lastFullText.get(el.id);
+      const existing = state.get(el.id);
+      const currentDisplayed = existing
+        ? existing.target.slice(0, existing.displayedLen)
+        : (previousFull ?? "");
+
+      if (currentDisplayed === target) {
+        // Already showing the right thing; ensure no stale tween hangs around.
+        state.delete(el.id);
+        lastFullText.set(el.id, target);
+        continue;
+      }
+
+      if (target.startsWith(currentDisplayed)) {
+        // Pure extension — keep typing forward without erasing.
+        state.set(el.id, {
+          target,
+          displayedLen: currentDisplayed.length,
+          eraseTo: null,
+        });
+      } else {
+        // Diverged: erase to common prefix, then type the new suffix.
+        const cp = commonPrefixLen(currentDisplayed, target);
+        state.set(el.id, {
+          target,
+          displayedLen: currentDisplayed.length, // start from what's on screen
+          eraseTo: cp,
+        });
+      }
+      lastFullText.set(el.id, target);
+    }
+    // Drop tweens for text elements that disappeared from the scene.
+    for (const id of state.keys()) {
+      if (!seenIds.has(id)) state.delete(id);
+    }
+    for (const id of lastFullText.keys()) {
+      if (!seenIds.has(id) && !typewriterSceneRef.current.has(id)) {
+        lastFullText.delete(id);
+      }
+    }
+  }
+
+  function applyTypewriterPatches(elements) {
+    const state = typewriterStateRef.current;
+    if (state.size === 0) return elements;
+    const showCursor = Math.floor(Date.now() / TYPEWRITER_CURSOR_BLINK_MS) % 2 === 0;
+    return elements.map((el) => {
+      const tween = state.get(el.id);
+      if (!tween) return el;
+      const visible = tween.target.slice(0, tween.displayedLen);
+      const isActive =
+        tween.displayedLen < tween.target.length || tween.eraseTo !== null;
+      const text = isActive && showCursor ? visible + TYPEWRITER_CURSOR : visible;
+      return { ...el, text };
+    });
+  }
+
+  function ensureTypewriterLoop() {
+    if (typewriterTimerRef.current) return;
+    if (typewriterStateRef.current.size === 0) return;
+    typewriterTimerRef.current = setTimeout(typewriterTick, TYPEWRITER_FRAME_MS);
+  }
+
+  function cancelTypewriterLoop() {
+    if (typewriterTimerRef.current) {
+      clearTimeout(typewriterTimerRef.current);
+      typewriterTimerRef.current = null;
+    }
+  }
+
+  function typewriterTick() {
+    typewriterTimerRef.current = null;
+    const state = typewriterStateRef.current;
+    const sceneMap = typewriterSceneRef.current;
+    const api = apiRef.current;
+    if (!api || sceneMap.size === 0) {
+      state.clear();
+      return;
+    }
+    let stillAnimating = false;
+    for (const [id, tween] of state) {
+      if (tween.eraseTo !== null && tween.displayedLen > tween.eraseTo) {
+        tween.displayedLen = Math.max(
+          tween.eraseTo,
+          tween.displayedLen - TYPEWRITER_ERASE_CHARS_PER_FRAME,
+        );
+        if (tween.displayedLen <= tween.eraseTo) {
+          tween.displayedLen = tween.eraseTo;
+          tween.eraseTo = null;
+        }
+        stillAnimating = true;
+      } else if (tween.displayedLen < tween.target.length) {
+        tween.displayedLen = Math.min(
+          tween.target.length,
+          tween.displayedLen + TYPEWRITER_CHARS_PER_FRAME,
+        );
+        stillAnimating = true;
+      } else {
+        // Done. Drop the tween so future renders don't carry a cursor.
+        state.delete(id);
+      }
+    }
+    // Always keep the cursor blinking visually even when no text is changing,
+    // so a freshly typed line shows the steady cursor for one blink before fade.
+    // We rely on stillAnimating to decide whether to schedule another tick.
+    const patched = Array.from(sceneMap.values()).map((el) => {
+      const tween = state.get(el.id);
+      if (!tween) return el;
+      const visible = tween.target.slice(0, tween.displayedLen);
+      const isActive =
+        tween.displayedLen < tween.target.length || tween.eraseTo !== null;
+      const showCursor =
+        Math.floor(Date.now() / TYPEWRITER_CURSOR_BLINK_MS) % 2 === 0;
+      const text =
+        isActive && showCursor ? visible + TYPEWRITER_CURSOR : visible;
+      return { ...el, text };
+    });
+    api.updateScene({ elements: patched });
+    if (stillAnimating || state.size > 0) {
+      typewriterTimerRef.current = setTimeout(
+        typewriterTick,
+        TYPEWRITER_FRAME_MS,
+      );
+    }
   }
 
   function applyWhiteboardViewportCommand(command) {
@@ -1857,6 +2051,12 @@ function PresentationEditor({ settings, onSave, onCancel }) {
   const [cinematicMode, setCinematicMode] = React.useState(
     current.cinematicMode !== false,
   );
+  const [cinematicZoom, setCinematicZoom] = React.useState(
+    String(current.cinematicZoom ?? 0.55),
+  );
+  const [typewriter, setTypewriter] = React.useState(
+    current.typewriter !== false,
+  );
   const [palette, setPalette] = React.useState(current.palette || "modern");
   const [fontFamily, setFontFamily] = React.useState(
     current.fontFamily || "Virgil",
@@ -1869,7 +2069,13 @@ function PresentationEditor({ settings, onSave, onCancel }) {
     setErrorText("");
     try {
       await onSave({
-        presentation: { cinematicMode, palette, fontFamily },
+        presentation: {
+          cinematicMode,
+          cinematicZoom: parseFloat(cinematicZoom),
+          typewriter,
+          palette,
+          fontFamily,
+        },
       });
     } catch (error) {
       setErrorText(error.message);
@@ -1895,6 +2101,35 @@ function PresentationEditor({ settings, onSave, onCancel }) {
           "span",
           { className: "field-toggle-hint" },
           "Smoothly pan + zoom to new elements as they appear.",
+        ),
+      ),
+    ),
+    cinematicMode
+      ? field(
+          "Zoom on new content",
+          labeledSelect(
+            cinematicZoom,
+            setCinematicZoom,
+            CINEMATIC_ZOOM_OPTIONS,
+            busy,
+          ),
+        )
+      : null,
+    field(
+      "Typewriter text",
+      React.createElement(
+        "label",
+        { className: "field-toggle" },
+        React.createElement("input", {
+          type: "checkbox",
+          checked: typewriter,
+          onChange: (e) => setTypewriter(e.target.checked),
+          disabled: busy,
+        }),
+        React.createElement(
+          "span",
+          { className: "field-toggle-hint" },
+          "New and edited text streams in char-by-char with a blinking cursor; corrections erase to the divergence point and retype.",
         ),
       ),
     ),
