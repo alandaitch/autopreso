@@ -9,6 +9,13 @@ const SAMPLE_RATE = 24000;
 // Without this, the agent only acts on the model's natural utterance breaks
 // (which require ~1s of silence), and continuous speech never triggers it.
 const DEFAULT_PARTIAL_QUIET_MS = 700;
+// Continuous speech caps. Without these, a long monologue accumulates into one
+// huge turn and the agent has nothing on screen until the speaker finally pauses.
+// Flushing on either threshold keeps the canvas reactive (~every 4s or 12 words);
+// the agent is built to refine prior elements on the next turn, so a partially
+// transcribed first turn is fine — it gets corrected as more arrives.
+const DEFAULT_MAX_PARTIAL_WORDS = 12;
+const DEFAULT_MAX_PARTIAL_MS = 4000;
 const SIDECAR_PACKAGE_BY_PLATFORM = new Map([
   ["darwin:arm64", "@autopreso/moonshine-darwin-arm64"],
   ["darwin:x64", "@autopreso/moonshine-darwin-x64"],
@@ -49,11 +56,23 @@ export function createMoonshineTranscription({
   let resolveReady = null;
   let rejectReady = null;
   let partialText = "";
+  let partialStartedAt = 0;
+  // Mid-utterance flushes (caps / quiet timer) are virtual — Moonshine itself
+  // keeps growing the same partial until it commits. Track what we've already
+  // queued so the next flush emits only the unsent suffix instead of repeating
+  // the whole partial as a new turn.
+  let flushedPrefix = "";
   let lastQueuedText = "";
   let quietTimer = null;
   const partialQuietMs = Number.isFinite(options?.moonshinePartialQuietMs)
     ? options.moonshinePartialQuietMs
     : DEFAULT_PARTIAL_QUIET_MS;
+  const maxPartialWords = Number.isFinite(options?.moonshineMaxPartialWords)
+    ? options.moonshineMaxPartialWords
+    : DEFAULT_MAX_PARTIAL_WORDS;
+  const maxPartialMs = Number.isFinite(options?.moonshineMaxPartialMs)
+    ? options.moonshineMaxPartialMs
+    : DEFAULT_MAX_PARTIAL_MS;
 
   function cancelQuietTimer() {
     if (quietTimer) {
@@ -65,10 +84,27 @@ export function createMoonshineTranscription({
   function flushPartialAsTurn() {
     cancelQuietTimer();
     const text = partialText.trim();
-    if (!text || text === lastQueuedText) return;
-    lastQueuedText = text;
-    sendTranscript({ type: "transcript:committed", text });
-    queueTranscript(text);
+    if (!text) return;
+    const newText = text.startsWith(flushedPrefix)
+      ? text.slice(flushedPrefix.length).trim()
+      : text;
+    if (!newText || newText === lastQueuedText) return;
+    flushedPrefix = text;
+    lastQueuedText = newText;
+    partialStartedAt = 0;
+    sendTranscript({ type: "transcript:committed", text: newText });
+    queueTranscript(newText);
+  }
+
+  function partialExceededCaps(text) {
+    if (maxPartialWords > 0) {
+      const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+      if (wordCount >= maxPartialWords) return true;
+    }
+    if (maxPartialMs > 0 && partialStartedAt > 0) {
+      if (Date.now() - partialStartedAt >= maxPartialMs) return true;
+    }
+    return false;
   }
 
   function scheduleQuietFlush() {
@@ -125,20 +161,39 @@ export function createMoonshineTranscription({
             // arriving for partialQuietMs, flushPartialAsTurn fires and the
             // agent turn runs without waiting for Moonshine to commit on its own.
             if (text === partialText) return;
+            if (!partialText && text) partialStartedAt = Date.now();
             partialText = text;
-            if (text) scheduleQuietFlush();
+            if (!text) {
+              partialStartedAt = 0;
+              cancelQuietTimer();
+              return;
+            }
+            // Cap: continuous speech with no pause should still produce frequent
+            // turns so the canvas updates while the speaker keeps talking.
+            if (partialExceededCaps(text)) {
+              flushPartialAsTurn();
+              return;
+            }
+            scheduleQuietFlush();
           },
           onCommitted: (text) => {
             // Moonshine's own utterance break beat us to it. Cancel the quiet
-            // timer, queue the committed text (de-duped against the last turn),
-            // and reset partial state for the next utterance.
+            // timer, emit only the unsent suffix (anything already flushed
+            // mid-utterance was sent as its own turn), and reset partial state.
             cancelQuietTimer();
             partialText = "";
+            partialStartedAt = 0;
             const trimmed = text.trim();
-            if (!trimmed || trimmed === lastQueuedText) return;
-            lastQueuedText = trimmed;
-            sendTranscript({ type: "transcript:committed", text: trimmed });
-            queueTranscript(trimmed);
+            const newText = trimmed.startsWith(flushedPrefix)
+              ? trimmed.slice(flushedPrefix.length).trim()
+              : trimmed;
+            // Utterance closed: drop the prefix tracker so the next utterance
+            // starts fresh regardless of what Moonshine emits.
+            flushedPrefix = "";
+            if (!newText || newText === lastQueuedText) return;
+            lastQueuedText = newText;
+            sendTranscript({ type: "transcript:committed", text: newText });
+            queueTranscript(newText);
           },
         });
       }
@@ -170,6 +225,8 @@ export function createMoonshineTranscription({
       rejectReady?.(error);
       cancelQuietTimer();
       partialText = "";
+      partialStartedAt = 0;
+      flushedPrefix = "";
       lastQueuedText = "";
       child = null;
       readyPromise = null;

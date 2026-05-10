@@ -1044,6 +1044,12 @@ For color and visual hierarchy:
 - Never assign a different color to each shape just to differentiate them. Position, label, and shape type already differentiate them.
 - The center or origin node of a hub-and-spoke, the conclusion of a flow, or the "headline" concept should get the accent color. Supporting nodes share the neutral color.
 
+For icons and visual interest, use Unicode emojis as inline icons:
+- A single well-chosen emoji at the start of a label or as a standalone marker reads as a clean icon and adds far more polish than another rectangle. Examples: 💡 idea/insight, 🎯 goal/target, 📊 metric/data, ⚠️ risk/warning, ✅ confirmed/done, ❌ blocker/no, ⚙️ system/process, 🚀 launch/release, 🧩 component/module, 🔑 key concept, 🧠 reasoning/AI, 🏷️ label/tag, 📅 date/timeline, 🔗 link/dependency, 💰 cost/revenue, 👥 users/team, 🌐 web/network.
+- Prefer the emoji over writing a redundant word: "💡 Insight" > "[icon] Insight: ...". One emoji per shape max; emojis are accents, not decoration.
+- For the "headline" / accent shape, an emoji works well as a focal indicator.
+- Skip emojis when they would clutter or when the talk is formal/technical and they would feel jarring.
+
 For text and labels:
 - ALWAYS use a shape's "label" field for any text that belongs INSIDE a shape (node names, card titles, button labels, anything inside a rectangle/ellipse/diamond). NEVER place a standalone "text" element on top of or overlapping a shape - Excalidraw renders standalone text by literal coordinates with no auto-centering or wrapping, so it will bleed outside the shape and look broken. Use the shape's label and Excalidraw will center and wrap correctly.
 - Standalone text elements are reserved for: the canvas title, top-level section headers placed CLEARLY OUTSIDE any shape, axis labels on charts, and arrow labels (use the arrow's label field, not a free-floating text element).
