@@ -519,12 +519,10 @@ export async function runWhiteboardAgent({ transcript, state, wss, options, gene
   });
   recordAgentCost(state, wss, agentProvider, result);
   options.onAgentEvent?.({ type: "model:end", transcript, result: summarizeAgentResult(result), timestamp: new Date().toISOString() });
-
-  if (mySession.active) {
-    state.agentHistory = appendWhiteboardAgentHistory(state.agentHistory, {
-      transcript,
-    });
-  }
+  // The speaker turn is appended to agentHistory by whiteboard-session.js's
+  // runTurn finally{}, regardless of whether this call succeeded, was cancelled,
+  // or errored. That guarantees the next turn always has the prior speech as
+  // context even when its agent invocation never completed.
   return result;
 }
 

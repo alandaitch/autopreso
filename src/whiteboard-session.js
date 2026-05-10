@@ -3,6 +3,19 @@ import { WebSocket } from "ws";
 import { createSessionCostTracker } from "./session-cost.js";
 import { createTranscriptTurnQueue } from "./transcript-turn-queue.js";
 
+// Mirrors src/server.js#appendWhiteboardAgentHistory. Defined here so we can
+// append from whiteboard-session.js's runTurn finally{} (catching cancelled
+// turns whose runWhiteboardAgent threw before reaching its own append site)
+// without a circular import. Server's exported version stays for tests.
+function appendSpeakerTurnToHistory(agentHistory, transcript) {
+  const trimmed = (transcript ?? "").trim();
+  if (!trimmed) return agentHistory;
+  return [
+    ...agentHistory,
+    { role: "user", content: `Speaker turn:\n${trimmed}` },
+  ];
+}
+
 const FILLER_WORDS = new Set([
   "uh", "uhh", "uhhh", "um", "umm", "ummm", "ah", "ahh", "er", "erm",
   "hmm", "hm", "huh", "mm", "mhm",
@@ -149,6 +162,13 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
           options.onAgentEvent?.({ type: "turn:error", transcript, error: error.message, timestamp: new Date().toISOString() });
         }
       } finally {
+        // Always record the speaker turn in agent history, regardless of
+        // whether the model completed, was cancelled, or errored. Without
+        // this, cancelled turns leak speech context and the agent loses the
+        // conversation thread.
+        if (mySession.active) {
+          state.agentHistory = appendSpeakerTurnToHistory(state.agentHistory, transcript);
+        }
         currentAbortController = null;
         state.agentBusy = false;
         publishAgentStatus();

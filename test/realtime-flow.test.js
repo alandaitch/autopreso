@@ -37,12 +37,13 @@ function collectMessages(ws) {
   return messages;
 }
 
-// buildWhiteboardAgentMessages emits two user messages per turn — the speaker
-// turn (formatSpeakerTurn output starts with "Speaker turn:") followed by the
-// canvas task message. Tests want the speaker turn so they can assert what the
-// agent was reacting to.
+// buildWhiteboardAgentMessages produces a sequence of user messages: agent
+// history first (which may include older speaker turns), then the CURRENT
+// speaker turn (formatSpeakerTurn output), then the canvas task message.
+// "Current" is the LAST "Speaker turn:..." message, not the first.
 function extractSpeakerTurn(messages) {
-  for (const m of messages) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
     if (m.role !== "user") continue;
     const text =
       typeof m.content === "string"
@@ -55,6 +56,25 @@ function extractSpeakerTurn(messages) {
     }
   }
   return null;
+}
+
+// Older speaker turns living in agent history. Excludes the current turn
+// (which is what extractSpeakerTurn returns).
+function extractHistorySpeakerTurns(messages) {
+  const all = [];
+  for (const m of messages) {
+    if (m.role !== "user") continue;
+    const text =
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content.find((p) => p.type === "text")?.text ?? ""
+          : "";
+    if (text.startsWith("Speaker turn:")) {
+      all.push(text.replace(/^Speaker turn:\s*/, ""));
+    }
+  }
+  return all.slice(0, -1); // drop the last — that's the current turn
 }
 
 function makeFakeTranscription() {
@@ -94,6 +114,14 @@ async function harness({ generateTextFn, agentLatencyMs = 0 } = {}) {
   // just want raw turn behavior.
   server.state.mode = "live";
   server.state.warmupPromise = Promise.resolve();
+  // Inject a fake staging primer at agentHistory[0] so the production path
+  // (extractPrimerText + reshapeMessagesForCodex) treats agentHistory[0] as
+  // the primer (real primers always live there). Without this, our pre-call
+  // appended speaker turns end up at index 0 and get dropped as "primer",
+  // distorting what the agent fn sees.
+  server.state.agentHistory = [
+    { role: "user", content: "Reference context for this presentation:\n(test primer)" },
+  ];
   const ws = new WebSocket(wsUrl(server.url));
   await new Promise((resolve, reject) => {
     ws.once("open", resolve);
@@ -211,18 +239,22 @@ test("realtime: rapid transcripts during a slow turn are buffered AND eventually
   }
 });
 
-test("realtime: cancelled turn's words are re-merged into the next turn (not lost)", async () => {
-  // First call: takes 200ms, never draws, gets cancelled.
-  // Second call: should see BOTH "first" AND "second" in its transcript.
-  const seenTranscripts = [];
+test("realtime: cancelled turn's transcript is preserved in agent history (not in next transcript)", async () => {
+  // When turn 1 is cancelled mid-thinking, its transcript should land in
+  // agentHistory so turn 2 has context — but turn 2's transcript itself must
+  // be JUST the new chunk, not a merged super-turn. This is the fix for the
+  // endless growing super-turn bug observed in production.
+  const seenPerTurn = [];
   let counter = 0;
   const fn = async ({ messages, abortSignal, tools }) => {
     counter += 1;
     const myId = counter;
-    const transcript = extractSpeakerTurn(messages);
-    seenTranscripts.push({ id: myId, transcript });
+    seenPerTurn.push({
+      id: myId,
+      transcript: extractSpeakerTurn(messages),
+      historyTurns: extractHistorySpeakerTurns(messages),
+    });
     if (myId === 1) {
-      // First turn: stall 200ms, then would draw — but expect to be aborted first.
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => resolve({ text: "DONE", finishReason: "stop" }), 200);
         abortSignal?.addEventListener("abort", () => {
@@ -231,7 +263,6 @@ test("realtime: cancelled turn's words are re-merged into the next turn (not los
         });
       });
     }
-    // Second turn: draw immediately so we can assert it ran with combined text.
     await tools.whiteboard_apply.execute({
       operations: [{
         type: "insert_after", line: 0,
@@ -243,14 +274,18 @@ test("realtime: cancelled turn's words are re-merged into the next turn (not los
   const h = await harness({ generateTextFn: fn });
   try {
     h.fake.feedTranscript("first");
-    await new Promise((r) => setTimeout(r, 50)); // give turn 1 time to start (but not finish)
+    await new Promise((r) => setTimeout(r, 50)); // turn 1 in flight
     h.fake.feedTranscript("second");
     await h.state.idle();
-    const second = seenTranscripts.find((t) => t.id === 2);
+    const second = seenPerTurn.find((t) => t.id === 2);
     assert.ok(second, "expected a second turn to run after cancel");
-    // Both fragments must be present in the merged transcript.
-    assert.match(second.transcript, /first/);
-    assert.match(second.transcript, /second/);
+    // CRITICAL: turn 2's TRANSCRIPT (current speaker turn) must be ONLY "second".
+    assert.equal(second.transcript, "second", `turn 2's transcript should be only the new chunk; got "${second.transcript}"`);
+    // But turn 2 should still have visibility into "first" via agent history.
+    assert.ok(
+      second.historyTurns.some((t) => t.includes("first")),
+      `turn 2 should see 'first' in history; saw history turns: ${JSON.stringify(second.historyTurns)}`,
+    );
   } finally {
     await h.close();
   }
