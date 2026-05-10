@@ -255,7 +255,9 @@ async function createTranscriptionManager({ options, wss, queueTranscript, state
     return {
       ...options,
       moonshineModel: settings.transcription.moonshine.model,
+      moonshineLanguage: settings.transcription.moonshine.language,
       openaiTranscriptionModel: settings.transcription.openai.model,
+      openaiTranscriptionLanguage: settings.transcription.openai.language,
       env: { ...(options.env ?? process.env), OPENAI_API_KEY: settings.apiKeys?.openai || (options.env ?? process.env).OPENAI_API_KEY },
     };
   }
@@ -269,8 +271,13 @@ async function createTranscriptionManager({ options, wss, queueTranscript, state
 
   function describeLabel(settings) {
     if (settings) {
-      if (settings.transcription.provider === "openai") return `OpenAI ${settings.transcription.openai.model}`;
-      return `Moonshine ${settings.transcription.moonshine.model}`;
+      if (settings.transcription.provider === "openai") {
+        const lang = settings.transcription.openai.language;
+        const langSuffix = lang && lang !== "auto" ? ` (${lang})` : "";
+        return `OpenAI ${settings.transcription.openai.model}${langSuffix}`;
+      }
+      const lang = settings.transcription.moonshine.language || "en";
+      return `Moonshine ${settings.transcription.moonshine.model} (${lang})`;
     }
     if (options.transcriptionProvider === "openai") return `OpenAI ${options.openaiTranscriptionModel}`;
     return `Moonshine ${options.moonshineModel}`;

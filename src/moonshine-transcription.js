@@ -39,20 +39,36 @@ export function createMoonshineTranscription({
 }) {
   let child = null;
   let stdoutBuffer = "";
+  let stderrBuffer = "";
   let readyPromise = null;
   let resolveReady = null;
   let rejectReady = null;
+  // After a sidecar crash, sendAudio respawns and the new process can die before
+  // its stdin write returns, surfacing EPIPE on the next event-loop tick. Latch
+  // the failure so we stop respawning until applyCurrent rebuilds us cleanly.
+  let failed = false;
+  let lastError = null;
 
   function ensureChild() {
     if (child) return child;
+    if (failed) return null;
 
     const binary = resolveSidecarPath();
     readyPromise = new Promise((resolve, reject) => {
       resolveReady = resolve;
       rejectReady = reject;
     });
-    child = spawnProcess(binary, ["--model", options.moonshineModel, "--language", "en"], {
+    const language = options.moonshineLanguage || "en";
+    child = spawnProcess(binary, ["--model", options.moonshineModel, "--language", language], {
       stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    // EPIPE on stdin is expected if the child died between our last write and now.
+    // Swallow it — the close handler below already surfaces the underlying error.
+    child.stdin.on("error", (error) => {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code !== "EPIPE") {
+        sendTranscript({ type: "error", message: error.message });
+      }
     });
 
     child.stdout.on("data", (chunk) => {
@@ -60,22 +76,39 @@ export function createMoonshineTranscription({
       const lines = stdoutBuffer.split("\n");
       stdoutBuffer = lines.pop() ?? "";
       for (const line of lines) {
-        handleSidecarLine(line, { sendTranscript, queueTranscript, onReady: resolveReady });
+        handleSidecarLine(line, { sendTranscript, queueTranscript, onReady: () => {
+          // Once the sidecar is healthy, clear the failure latch and stderr buffer.
+          failed = false;
+          stderrBuffer = "";
+          resolveReady?.();
+        } });
       }
     });
 
     child.stderr.on("data", (chunk) => {
-      const message = chunk.toString("utf8").trim();
+      const text = chunk.toString("utf8");
+      stderrBuffer += text;
+      const message = text.trim();
       if (message) sendTranscript({ type: "error", message });
     });
 
     child.on("error", (error) => {
+      lastError = error;
       sendTranscript({ type: "error", message: error.message });
       rejectReady?.(error);
     });
 
     child.on("close", (code) => {
-      rejectReady?.(new Error(`Moonshine sidecar exited before it was ready${code === null ? "" : ` (code ${code})`}.`));
+      // If the sidecar exited before emitting `ready`, surface the captured stderr
+      // (more useful than a generic "exited" message) and latch the failure so we
+      // don't enter a respawn loop on every audio frame.
+      const stderrTail = stderrBuffer.trim().split("\n").slice(-3).join("\n");
+      const reason = stderrTail || `exit code ${code}`;
+      const error = new Error(`Moonshine sidecar exited before it was ready: ${reason}`);
+      lastError = error;
+      failed = true;
+      sendTranscript({ type: "error", message: friendlyMoonshineError(stderrTail, options) });
+      rejectReady?.(error);
       child = null;
       readyPromise = null;
       resolveReady = null;
@@ -99,11 +132,20 @@ export function createMoonshineTranscription({
         sendTranscript({ type: "error", message: error.message });
         return;
       }
-      process.stdin.write(`${JSON.stringify({ type: "audio", encoding: "pcm16le", sampleRate: SAMPLE_RATE, audio })}\n`);
+      if (!process) return; // failed-latch: don't re-spawn until applyCurrent rebuilds us
+      try {
+        process.stdin.write(`${JSON.stringify({ type: "audio", encoding: "pcm16le", sampleRate: SAMPLE_RATE, audio })}\n`);
+      } catch (error) {
+        if (error?.code !== "EPIPE") sendTranscript({ type: "error", message: error.message });
+      }
     },
     stop: () => {
       if (!child) return;
-      child.stdin.write(`${JSON.stringify({ type: "stop" })}\n`);
+      try {
+        child.stdin.write(`${JSON.stringify({ type: "stop" })}\n`);
+      } catch (error) {
+        if (error?.code !== "EPIPE") sendTranscript({ type: "error", message: error.message });
+      }
     },
     close: () => {
       if (!child) return;
@@ -112,6 +154,17 @@ export function createMoonshineTranscription({
       child = null;
     },
   };
+}
+
+function friendlyMoonshineError(stderrTail, options) {
+  if (/Model not found for language/.test(stderrTail)) {
+    const lang = options?.moonshineLanguage || "en";
+    const model = options?.moonshineModel || "medium";
+    return `Moonshine model "${model}" is not available for language "${lang}". The shipped sidecar only ships English (tiny/small/medium); other languages require a sidecar rebuild that registers the "base" arch.`;
+  }
+  return stderrTail
+    ? `Moonshine sidecar exited before it was ready: ${stderrTail}`
+    : "Moonshine sidecar exited before it was ready.";
 }
 
 function handleSidecarLine(line, { sendTranscript, queueTranscript, onReady }) {

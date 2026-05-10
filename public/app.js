@@ -19,6 +19,22 @@ const OPENAI_TRANSCRIPTION_MODELS = [
   "whisper-1",
 ];
 const MOONSHINE_MODELS = ["tiny", "small", "medium"];
+// English uses the streaming arch the user picks (tiny/small/medium). Other languages
+// transparently fall back to the BASE arch in the sidecar — moonshine-voice ships
+// multilingual support only via base-XX models. Models are downloaded on demand the
+// first time a new language is requested.
+const MOONSHINE_LANGUAGES = [
+  ["en", "English"], ["es", "Spanish"], ["zh", "Mandarin"], ["ja", "Japanese"],
+  ["ko", "Korean"], ["vi", "Vietnamese"], ["ar", "Arabic"], ["uk", "Ukrainian"],
+];
+// OpenAI Realtime accepts ISO language hints; "auto" omits the hint and lets it detect.
+const OPENAI_TRANSCRIPTION_LANGUAGES = [
+  ["auto", "Auto-detect"], ["en", "English"], ["es", "Spanish"], ["pt", "Portuguese"],
+  ["fr", "French"], ["de", "German"], ["it", "Italian"], ["nl", "Dutch"],
+  ["ja", "Japanese"], ["ko", "Korean"], ["zh", "Chinese"], ["ar", "Arabic"],
+  ["hi", "Hindi"], ["ru", "Russian"], ["uk", "Ukrainian"], ["pl", "Polish"],
+  ["tr", "Turkish"], ["vi", "Vietnamese"], ["id", "Indonesian"],
+];
 const MIC_STORAGE_KEY = "autopreso.mic";
 
 const STARTER_STAGING_ELEMENTS = [];
@@ -1493,8 +1509,14 @@ function TranscriptionEditor({ settings, onSave, onCancel }) {
   const [moonshineModel, setMoonshineModel] = React.useState(
     settings.transcription.moonshine.model,
   );
+  const [moonshineLanguage, setMoonshineLanguage] = React.useState(
+    settings.transcription.moonshine.language || "en",
+  );
   const [openaiModel, setOpenaiModel] = React.useState(
     settings.transcription.openai.model,
+  );
+  const [openaiLanguage, setOpenaiLanguage] = React.useState(
+    settings.transcription.openai.language || "auto",
   );
   const [openaiKey, setOpenaiKey] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -1507,9 +1529,14 @@ function TranscriptionEditor({ settings, onSave, onCancel }) {
     setBusy(true);
     setErrorText("");
     const patch = { transcription: { provider, moonshine: {}, openai: {} } };
-    if (provider === "moonshine")
+    if (provider === "moonshine") {
       patch.transcription.moonshine.model = moonshineModel;
-    if (provider === "openai") patch.transcription.openai.model = openaiModel;
+      patch.transcription.moonshine.language = moonshineLanguage;
+    }
+    if (provider === "openai") {
+      patch.transcription.openai.model = openaiModel;
+      patch.transcription.openai.language = openaiLanguage;
+    }
     if (openaiKey) patch.apiKeys = { openai: openaiKey };
     try {
       await onSave(patch);
@@ -1545,6 +1572,17 @@ function TranscriptionEditor({ settings, onSave, onCancel }) {
           select(moonshineModel, setMoonshineModel, MOONSHINE_MODELS, busy),
         )
       : null,
+    provider === "moonshine"
+      ? field(
+          "Language",
+          labeledSelect(
+            moonshineLanguage,
+            setMoonshineLanguage,
+            MOONSHINE_LANGUAGES,
+            busy,
+          ),
+        )
+      : null,
     provider === "openai"
       ? field(
           "Model",
@@ -1552,6 +1590,17 @@ function TranscriptionEditor({ settings, onSave, onCancel }) {
             openaiModel,
             setOpenaiModel,
             OPENAI_TRANSCRIPTION_MODELS,
+            busy,
+          ),
+        )
+      : null,
+    provider === "openai"
+      ? field(
+          "Language",
+          labeledSelect(
+            openaiLanguage,
+            setOpenaiLanguage,
+            OPENAI_TRANSCRIPTION_LANGUAGES,
             busy,
           ),
         )
@@ -1616,6 +1665,14 @@ function select(value, onChange, options, disabled) {
     options.map((option) =>
       React.createElement("option", { key: option, value: option }, option),
     ),
+  );
+}
+
+function labeledSelect(value, onChange, options, disabled) {
+  return React.createElement(
+    "select",
+    { value, onChange: (e) => onChange(e.target.value), disabled },
+    options.map(([code, label]) => React.createElement("option", { key: code, value: code }, `${label} (${code})`)),
   );
 }
 

@@ -23,8 +23,10 @@ const MODELS_WITHOUT_PROMPT_SUPPORT = new Set(["gpt-realtime-whisper"]);
 // mid-sentence breaths without splitting one thought into multiple turns.
 const DEFAULT_DELTA_QUIET_MS = 1000;
 
-function buildTranscriptionSession(model, vocabularyPrompt, { includeEmptyPrompt = false } = {}) {
+function buildTranscriptionSession(model, vocabularyPrompt, { includeEmptyPrompt = false, language = "" } = {}) {
   const transcription = { model };
+  const normalizedLanguage = normalizeOpenAILanguage(language);
+  if (normalizedLanguage) transcription.language = normalizedLanguage;
   if (!MODELS_WITHOUT_PROMPT_SUPPORT.has(model)) {
     if (vocabularyPrompt) transcription.prompt = vocabularyPrompt;
     else if (includeEmptyPrompt) transcription.prompt = "";
@@ -38,6 +40,13 @@ function buildTranscriptionSession(model, vocabularyPrompt, { includeEmptyPrompt
       },
     },
   };
+}
+
+function normalizeOpenAILanguage(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed || trimmed === "auto") return "";
+  return trimmed;
 }
 
 export function createOpenAITranscription({
@@ -121,7 +130,9 @@ export function createOpenAITranscription({
       configured = true;
       socket.send(JSON.stringify({
         type: "session.update",
-        session: buildTranscriptionSession(options.openaiTranscriptionModel, vocabularyPrompt),
+        session: buildTranscriptionSession(options.openaiTranscriptionModel, vocabularyPrompt, {
+          language: options.openaiTranscriptionLanguage,
+        }),
       }));
       for (const audio of pendingAudio) {
         socket.send(JSON.stringify({ type: "input_audio_buffer.append", audio }));
@@ -224,7 +235,10 @@ export function createOpenAITranscription({
       // clear a previously-set prompt by sending an explicit empty string.
       socket.send(JSON.stringify({
         type: "session.update",
-        session: buildTranscriptionSession(options.openaiTranscriptionModel, vocabularyPrompt, { includeEmptyPrompt: true }),
+        session: buildTranscriptionSession(options.openaiTranscriptionModel, vocabularyPrompt, {
+          includeEmptyPrompt: true,
+          language: options.openaiTranscriptionLanguage,
+        }),
       }));
     },
     stop: () => {

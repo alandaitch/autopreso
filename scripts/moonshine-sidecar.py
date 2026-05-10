@@ -20,7 +20,14 @@ MODEL_ARCH_BY_NAME = {
     "tiny": ModelArch.TINY_STREAMING,
     "small": ModelArch.SMALL_STREAMING,
     "medium": ModelArch.MEDIUM_STREAMING,
+    "base": ModelArch.BASE,
 }
+
+# moonshine-voice ships streaming archs (tiny/small/medium) for English only.
+# Multilingual support lives in the BASE arch (e.g. base-es, base-zh). When the
+# user picks a non-English language we transparently fall back to BASE so the
+# requested model+language combo always resolves.
+ENGLISH_ONLY_ARCHS = {"tiny", "small", "medium"}
 
 
 def emit(message):
@@ -52,9 +59,14 @@ def main():
     parser.add_argument("--language", default="en")
     args = parser.parse_args()
 
+    requested_model = args.model
+    effective_model = requested_model
+    if args.language != "en" and requested_model in ENGLISH_ONLY_ARCHS:
+        effective_model = "base"
+
     model_path, model_arch = get_model_for_language(
         wanted_language=args.language,
-        wanted_model_arch=MODEL_ARCH_BY_NAME[args.model],
+        wanted_model_arch=MODEL_ARCH_BY_NAME[effective_model],
     )
     transcriber = Transcriber(model_path=model_path, model_arch=model_arch)
     transcriber.add_listener(JsonTranscriptListener())
