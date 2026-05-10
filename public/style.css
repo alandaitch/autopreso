@@ -274,14 +274,24 @@ body {
   color: #1862ab;
 }
 
-.mode-toggle-live {
+.mode-toggle-preso {
   background: #fff1f1;
   border-color: #fca5a5;
 }
 
-.mode-toggle-live .mode-toggle-option.active {
+.mode-toggle-preso .mode-toggle-option.active {
   background: #fee2e2;
   color: #b91c1c;
+}
+
+.mode-toggle-slides {
+  background: #f3e8ff;
+  border-color: #c4b5fd;
+}
+
+.mode-toggle-slides .mode-toggle-option.active {
+  background: #ede9fe;
+  color: #6d28d9;
 }
 
 .shell.mode-staging .canvas-wrap {

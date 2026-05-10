@@ -633,6 +633,27 @@ function App() {
     else startListening();
   }
 
+  async function startPresoWithLayout(targetLayoutMode) {
+    // Switch into Preso (live) mode using the given layout. If we're already
+    // live, change layout by going back to staging first (resets the session
+    // primer + warmup cache for the new mode), then start fresh. If layout
+    // already matches, no-op.
+    const currentLayout = settings?.presentation?.layoutMode || "whiteboard";
+    if (mode === "live" && currentLayout === targetLayoutMode) return;
+    if (currentLayout !== targetLayoutMode) {
+      try {
+        await saveSettings({ presentation: { layoutMode: targetLayoutMode } });
+      } catch (err) {
+        setError(err.message);
+        return;
+      }
+    }
+    if (mode === "live") {
+      await backToStaging();
+    }
+    await startPreso();
+  }
+
   async function startPreso() {
     if (presoStarting) return;
     const excalidrawAPI = apiRef.current;
@@ -1155,42 +1176,61 @@ function App() {
           "div",
           { className: "brand-row" },
           React.createElement("h1", null, "Auto Preso"),
-          React.createElement(
-            "div",
-            {
-              className: `mode-toggle mode-toggle-${mode}`,
-              role: "group",
-              "aria-label": "Mode",
-            },
-            React.createElement(
-              "button",
+          (() => {
+            const layoutMode = settings?.presentation?.layoutMode || "whiteboard";
+            const activeTab =
+              mode === "staging"
+                ? "staging"
+                : layoutMode === "slides"
+                  ? "slides"
+                  : "preso";
+            return React.createElement(
+              "div",
               {
-                type: "button",
-                className: `mode-toggle-option ${mode === "staging" ? "active" : ""}`,
-                onClick: () => {
-                  if (mode !== "staging") backToStaging();
-                },
-                disabled: presoStarting,
-                title: "Staging mode",
-                "aria-pressed": mode === "staging",
+                className: `mode-toggle mode-toggle-${activeTab}`,
+                role: "group",
+                "aria-label": "Mode",
               },
-              "Staging",
-            ),
-            React.createElement(
-              "button",
-              {
-                type: "button",
-                className: `mode-toggle-option ${mode === "live" ? "active" : ""}`,
-                onClick: () => {
-                  if (mode !== "live") startPreso();
+              React.createElement(
+                "button",
+                {
+                  type: "button",
+                  className: `mode-toggle-option ${activeTab === "staging" ? "active" : ""}`,
+                  onClick: () => {
+                    if (mode !== "staging") backToStaging();
+                  },
+                  disabled: presoStarting,
+                  title: "Staging mode",
+                  "aria-pressed": activeTab === "staging",
                 },
-                disabled: presoStarting,
-                title: presoStarting ? "Starting..." : "Preso mode",
-                "aria-pressed": mode === "live",
-              },
-              presoStarting && mode === "staging" ? "..." : "Preso",
-            ),
-          ),
+                "Staging",
+              ),
+              React.createElement(
+                "button",
+                {
+                  type: "button",
+                  className: `mode-toggle-option ${activeTab === "preso" ? "active" : ""}`,
+                  onClick: () => startPresoWithLayout("whiteboard"),
+                  disabled: presoStarting,
+                  title: presoStarting ? "Starting..." : "Whiteboard preso (free-form canvas)",
+                  "aria-pressed": activeTab === "preso",
+                },
+                presoStarting && activeTab !== "preso" ? "..." : "Preso",
+              ),
+              React.createElement(
+                "button",
+                {
+                  type: "button",
+                  className: `mode-toggle-option ${activeTab === "slides" ? "active" : ""}`,
+                  onClick: () => startPresoWithLayout("slides"),
+                  disabled: presoStarting,
+                  title: presoStarting ? "Starting..." : "Slides preso (one slide at a time)",
+                  "aria-pressed": activeTab === "slides",
+                },
+                presoStarting && activeTab !== "slides" ? "..." : "Slides",
+              ),
+            );
+          })(),
         ),
         React.createElement(
           "p",
