@@ -4,6 +4,11 @@ import path from "node:path";
 
 const require = createRequire(import.meta.url);
 const SAMPLE_RATE = 24000;
+// If the rolling partial transcript hasn't grown for this long, treat it as
+// a turn even if Moonshine itself hasn't emitted `transcript:committed` yet.
+// Without this, the agent only acts on the model's natural utterance breaks
+// (which require ~1s of silence), and continuous speech never triggers it.
+const DEFAULT_PARTIAL_QUIET_MS = 700;
 const SIDECAR_PACKAGE_BY_PLATFORM = new Map([
   ["darwin:arm64", "@autopreso/moonshine-darwin-arm64"],
   ["darwin:x64", "@autopreso/moonshine-darwin-x64"],
@@ -43,6 +48,37 @@ export function createMoonshineTranscription({
   let readyPromise = null;
   let resolveReady = null;
   let rejectReady = null;
+  let partialText = "";
+  let lastQueuedText = "";
+  let quietTimer = null;
+  const partialQuietMs = Number.isFinite(options?.moonshinePartialQuietMs)
+    ? options.moonshinePartialQuietMs
+    : DEFAULT_PARTIAL_QUIET_MS;
+
+  function cancelQuietTimer() {
+    if (quietTimer) {
+      clearTimeout(quietTimer);
+      quietTimer = null;
+    }
+  }
+
+  function flushPartialAsTurn() {
+    cancelQuietTimer();
+    const text = partialText.trim();
+    if (!text || text === lastQueuedText) return;
+    lastQueuedText = text;
+    sendTranscript({ type: "transcript:committed", text });
+    queueTranscript(text);
+  }
+
+  function scheduleQuietFlush() {
+    cancelQuietTimer();
+    if (partialQuietMs <= 0) return;
+    quietTimer = setTimeout(() => {
+      quietTimer = null;
+      flushPartialAsTurn();
+    }, partialQuietMs);
+  }
   // After a sidecar crash, sendAudio respawns and the new process can die before
   // its stdin write returns, surfacing EPIPE on the next event-loop tick. Latch
   // the failure so we stop respawning until applyCurrent rebuilds us cleanly.
@@ -76,12 +112,35 @@ export function createMoonshineTranscription({
       const lines = stdoutBuffer.split("\n");
       stdoutBuffer = lines.pop() ?? "";
       for (const line of lines) {
-        handleSidecarLine(line, { sendTranscript, queueTranscript, onReady: () => {
-          // Once the sidecar is healthy, clear the failure latch and stderr buffer.
-          failed = false;
-          stderrBuffer = "";
-          resolveReady?.();
-        } });
+        handleSidecarLine(line, {
+          sendTranscript,
+          onReady: () => {
+            // Once the sidecar is healthy, clear the failure latch and stderr buffer.
+            failed = false;
+            stderrBuffer = "";
+            resolveReady?.();
+          },
+          onPartial: (text) => {
+            // Re-arm the quiet timer on every partial growth. When deltas stop
+            // arriving for partialQuietMs, flushPartialAsTurn fires and the
+            // agent turn runs without waiting for Moonshine to commit on its own.
+            if (text === partialText) return;
+            partialText = text;
+            if (text) scheduleQuietFlush();
+          },
+          onCommitted: (text) => {
+            // Moonshine's own utterance break beat us to it. Cancel the quiet
+            // timer, queue the committed text (de-duped against the last turn),
+            // and reset partial state for the next utterance.
+            cancelQuietTimer();
+            partialText = "";
+            const trimmed = text.trim();
+            if (!trimmed || trimmed === lastQueuedText) return;
+            lastQueuedText = trimmed;
+            sendTranscript({ type: "transcript:committed", text: trimmed });
+            queueTranscript(trimmed);
+          },
+        });
       }
     });
 
@@ -109,6 +168,9 @@ export function createMoonshineTranscription({
       failed = true;
       sendTranscript({ type: "error", message: friendlyMoonshineError(stderrTail, options) });
       rejectReady?.(error);
+      cancelQuietTimer();
+      partialText = "";
+      lastQueuedText = "";
       child = null;
       readyPromise = null;
       resolveReady = null;
@@ -140,6 +202,9 @@ export function createMoonshineTranscription({
       }
     },
     stop: () => {
+      // User-initiated stop should drain whatever partial we have right now
+      // rather than wait for the quiet timer; idempotent.
+      flushPartialAsTurn();
       if (!child) return;
       try {
         child.stdin.write(`${JSON.stringify({ type: "stop" })}\n`);
@@ -148,6 +213,7 @@ export function createMoonshineTranscription({
       }
     },
     close: () => {
+      cancelQuietTimer();
       if (!child) return;
       child.stdin.end();
       child.kill();
@@ -167,7 +233,7 @@ function friendlyMoonshineError(stderrTail, options) {
     : "Moonshine sidecar exited before it was ready.";
 }
 
-function handleSidecarLine(line, { sendTranscript, queueTranscript, onReady }) {
+function handleSidecarLine(line, { sendTranscript, onReady, onPartial, onCommitted }) {
   if (!line.trim()) return;
 
   let message;
@@ -184,13 +250,14 @@ function handleSidecarLine(line, { sendTranscript, queueTranscript, onReady }) {
   }
 
   if (message.type === "transcript:partial") {
-    sendTranscript({ type: "transcript:partial", text: message.text ?? "" });
+    const text = message.text ?? "";
+    sendTranscript({ type: "transcript:partial", text });
+    onPartial?.(text);
   }
 
   if (message.type === "transcript:committed") {
     const text = message.text ?? "";
-    sendTranscript({ type: "transcript:committed", text });
-    queueTranscript(text);
+    onCommitted?.(text);
   }
 
   if (message.type === "error") {

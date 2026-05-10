@@ -20,7 +20,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   presentation: {
     cinematicMode: true,
     palette: "modern",
-    fontFamily: "Virgil",
+    // Excalifont is Excalidraw 0.18's bundled default font, so it's already
+    // loaded when text first appears. Other fonts (Virgil/Helvetica/Cascadia)
+    // are fetched on demand and flash with a serif fallback while loading.
+    fontFamily: "Excalifont",
   },
   apiKeys: {
     openai: "",
