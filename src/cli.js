@@ -51,6 +51,29 @@ async function main() {
     ...options,
     settingsStore,
     onStatus: (message) => console.log(message),
+    onAgentEvent: (event) => {
+      // Surface high-level agent lifecycle so the operator can see what the
+      // bot is actually doing (turns starting, cancelling, drawing, errors).
+      // Tool inputs / model messages are noisy — don't dump those by default.
+      const t = event.type;
+      if (t === "turn:start") {
+        const trimmed = (event.transcript ?? "").slice(0, 80);
+        console.log(`[agent] turn:start "${trimmed}${event.transcript?.length > 80 ? "..." : ""}"`);
+      } else if (t === "turn:end") {
+        console.log("[agent] turn:end");
+      } else if (t === "turn:cancelled") {
+        const trimmed = (event.transcript ?? "").slice(0, 80);
+        console.log(`[agent] turn:cancelled (fresher transcript arrived) "${trimmed}"`);
+      } else if (t === "turn:error") {
+        console.error(`[agent] turn:error ${event.error}`);
+      } else if (t === "tool:start") {
+        console.log(`[agent] tool:start ${event.tool}`);
+      } else if (t === "tool:end") {
+        console.log(`[agent] tool:end ${event.tool} (${event.elements?.length ?? "?"} elements on canvas)`);
+      } else if (t === "warmup:error") {
+        console.error(`[agent] warmup attempt ${event.attempt} failed: ${event.error}`);
+      }
+    },
   });
 
   console.log(`autopreso listening at ${url}`);

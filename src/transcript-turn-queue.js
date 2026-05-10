@@ -13,6 +13,10 @@ export function createTranscriptTurnQueue({
   let running = false;
   let buffered = [];
   let current = Promise.resolve();
+  // Text being processed by the in-flight turn. If cancelInflight aborts it,
+  // we re-prepend this to buffered so the cancelled words don't disappear.
+  let runningText = "";
+  let cancelInflightFiredForRunning = false;
   // Pending bucket holds chunks that arrived too recently to fire yet. Waiting
   // a short window lets bursts of small transcript chunks coalesce into one
   // turn. The isReady predicate gates whether the accumulated buffer has
@@ -36,9 +40,13 @@ export function createTranscriptTurnQueue({
       // Try to cancel the in-flight turn so the agent re-runs with the freshest
       // context instead of finishing on stale input. The actual abort happens
       // inside cancelInflight; the runTurn promise will reject/resolve and the
-      // existing drain() loop picks up `buffered` to start the next turn.
+      // existing drain() loop picks up `buffered` to start the next turn. If
+      // it returns true, mark that the in-flight text needs to be re-merged
+      // with whatever's queued so the cancelled words aren't lost.
       if (typeof cancelInflight === "function") {
-        try { cancelInflight(text); } catch { /* swallow */ }
+        try {
+          if (cancelInflight(text)) cancelInflightFiredForRunning = true;
+        } catch { /* swallow */ }
       }
     } else {
       current = drain(text);
@@ -47,9 +55,20 @@ export function createTranscriptTurnQueue({
 
   async function drain(text) {
     running = true;
+    runningText = text;
+    cancelInflightFiredForRunning = false;
     try {
       await runTurn(text);
     } finally {
+      // If the turn was cancelled mid-flight, the words it was processing
+      // never reached the agent (or reached it but were aborted before
+      // drawing). Re-prepend them to buffered so the next turn sees the
+      // full conversation, not just the fresh chunk that triggered the cancel.
+      if (cancelInflightFiredForRunning && runningText) {
+        buffered.unshift(runningText);
+      }
+      runningText = "";
+      cancelInflightFiredForRunning = false;
       if (buffered.length > 0) {
         const next = buffered.join("\n");
         buffered = [];
