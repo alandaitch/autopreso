@@ -17,6 +17,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
     moonshine: { model: "medium", language: "en" },
     openai: { model: "gpt-realtime-whisper", language: "auto" },
   },
+  presentation: {
+    cinematicMode: true,
+    palette: "modern",
+    fontFamily: "Virgil",
+  },
   apiKeys: {
     openai: "",
   },

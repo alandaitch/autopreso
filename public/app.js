@@ -37,7 +37,85 @@ const OPENAI_TRANSCRIPTION_LANGUAGES = [
 ];
 const MIC_STORAGE_KEY = "autopreso.mic";
 
+// Presentation theming. "auto" = let the agent's own colors / Excalidraw defaults
+// pass through untouched; any other key = override drawn elements client-side.
+const PRESENTATION_PALETTES = {
+  auto: null,
+  modern: {
+    label: "Modern (cool)",
+    stroke: "#1f2937",
+    fills: ["#dbeafe", "#dcfce7", "#fef3c7", "#fce7f3", "#e0e7ff"],
+  },
+  vibrant: {
+    label: "Vibrant",
+    stroke: "#0f172a",
+    fills: ["#fca5a5", "#fcd34d", "#86efac", "#93c5fd", "#c4b5fd"],
+  },
+  pastel: {
+    label: "Pastel",
+    stroke: "#475569",
+    fills: ["#fde2e7", "#dbeafe", "#dcfce7", "#fef3c7", "#ede9fe"],
+  },
+  mono: {
+    label: "Mono",
+    stroke: "#0f172a",
+    fills: ["#f3f4f6", "#e5e7eb", "#d1d5db", "#cbd5e1", "#94a3b8"],
+  },
+  warm: {
+    label: "Warm",
+    stroke: "#7c2d12",
+    fills: ["#fee2e2", "#ffedd5", "#fef3c7", "#fde68a", "#fed7aa"],
+  },
+};
+const PRESENTATION_PALETTE_OPTIONS = Object.entries(PRESENTATION_PALETTES).map(
+  ([key, value]) => [key, value ? value.label : "Auto (agent's own colors)"],
+);
+
+// Excalidraw stores fontFamily as a numeric enum. These match Excalidraw 0.18's defaults.
+const PRESENTATION_FONTS = {
+  Virgil: 1,
+  Helvetica: 2,
+  Cascadia: 3,
+  Excalifont: 5,
+};
+const PRESENTATION_FONT_OPTIONS = Object.entries(PRESENTATION_FONTS).map(
+  ([name]) => [name, name],
+);
+
+// Cinematic mode tween config. 8 frames at ~45ms ≈ 360ms total — long enough to
+// feel smooth, short enough not to delay the next agent turn or thrash Excalidraw.
+const CINEMATIC_TWEEN_FRAMES = 8;
+const CINEMATIC_TWEEN_FRAME_MS = 45;
+
 const STARTER_STAGING_ELEMENTS = [];
+
+function applyPresentationStyle(elements, presentation) {
+  if (!presentation) return elements;
+  const palette = PRESENTATION_PALETTES[presentation.palette];
+  const fontId = PRESENTATION_FONTS[presentation.fontFamily];
+  if (!palette && !fontId) return elements;
+  let fillIdx = 0;
+  return elements.map((el) => {
+    const next = { ...el };
+    if (palette) {
+      const t = next.type;
+      if (t === "rectangle" || t === "ellipse" || t === "diamond") {
+        next.strokeColor = palette.stroke;
+        next.backgroundColor = palette.fills[fillIdx % palette.fills.length];
+        if (next.fillStyle == null) next.fillStyle = "solid";
+        fillIdx++;
+      } else if (t === "arrow" || t === "line" || t === "freedraw") {
+        next.strokeColor = palette.stroke;
+      } else if (t === "text") {
+        next.strokeColor = palette.stroke;
+      }
+    }
+    if (fontId && next.type === "text") {
+      next.fontFamily = fontId;
+    }
+    return next;
+  });
+}
 
 function fullscreenIcon(isFullscreen) {
   const paths = isFullscreen
@@ -103,6 +181,9 @@ function App() {
   const [cost, setCost] = React.useState(null);
   const audioSessionRef = React.useRef(null);
   const apiRef = React.useRef(null);
+  const settingsRef = React.useRef(null);
+  const lastSceneIdsRef = React.useRef(new Set());
+  const cinematicTweenRef = React.useRef(null);
   const wsRef = React.useRef(null);
   const modeRef = React.useRef("staging");
   const stagingSceneRef = React.useRef(null);
@@ -144,12 +225,17 @@ function App() {
   }, [api]);
 
   React.useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  React.useEffect(() => {
     return () => {
       clearTimeout(screenshotTimerRef.current);
       clearTimeout(captionTimerRef.current);
       clearTimeout(resetConfirmTimerRef.current);
       clearTimeout(userElementsSyncTimerRef.current);
       clearTimeout(agentInstructionsSaveTimerRef.current);
+      clearTimeout(cinematicTweenRef.current);
     };
   }, []);
 
@@ -536,13 +622,33 @@ function App() {
     // focus_ids; if we let Excalidraw rewrite them, the frontend's
     // scene.filter(el => focusIds.includes(el.id)) finds nothing and
     // scrollToContent silently fits the full canvas instead.
-    const renderable = looksNative
+    let renderable = looksNative
       ? elements
       : convertToExcalidrawElements(elements, { regenerateIds: false });
-    excalidrawAPI.updateScene({
-      elements: renderable,
-      appState: { viewBackgroundColor: "#fffdf8" },
-    });
+    // Apply user-selected palette / font as a client-side override before render.
+    // "auto" palette is a no-op (passes the agent's own colors through).
+    const presentation = settingsRef.current?.presentation;
+    if (presentation) {
+      renderable = applyPresentationStyle(renderable, presentation);
+    }
+
+    // Cinematic mode: pan/zoom to frame newly arrived elements and fade them in.
+    const cinematic = presentation?.cinematicMode !== false;
+    const previousIds = lastSceneIdsRef.current;
+    const newElements = cinematic
+      ? renderable.filter((el) => el.id && !previousIds.has(el.id))
+      : [];
+    lastSceneIdsRef.current = new Set(renderable.map((el) => el.id));
+
+    if (cinematic && newElements.length > 0 && renderable.length > 0) {
+      runCinematicTransition(excalidrawAPI, renderable, newElements);
+    } else {
+      excalidrawAPI.updateScene({
+        elements: renderable,
+        appState: { viewBackgroundColor: "#fffdf8" },
+      });
+    }
+
     if (recenter && renderable.length > 0) {
       // Defer so updateScene's commit is flushed before scrollToContent measures bounds.
       requestAnimationFrame(() =>
@@ -550,6 +656,55 @@ function App() {
       );
     }
     scheduleWhiteboardScreenshot();
+  }
+
+  function runCinematicTransition(api, allElements, newElements) {
+    // Cancel any in-flight tween so a fresh update doesn't fight the previous one.
+    if (cinematicTweenRef.current) {
+      clearTimeout(cinematicTweenRef.current);
+      cinematicTweenRef.current = null;
+    }
+    const newIdSet = new Set(newElements.map((el) => el.id));
+    // Remember each new element's intended final opacity (agent may have set
+    // a non-100 value deliberately) so we tween to that, not always to 100.
+    const targetOpacityById = new Map(
+      newElements.map((el) => [
+        el.id,
+        typeof el.opacity === "number" ? el.opacity : 100,
+      ]),
+    );
+    const sceneFor = (progress) =>
+      allElements.map((el) => {
+        if (!newIdSet.has(el.id)) return el;
+        const target = targetOpacityById.get(el.id) ?? 100;
+        return { ...el, opacity: Math.round(target * progress) };
+      });
+
+    api.updateScene({
+      elements: sceneFor(0),
+      appState: { viewBackgroundColor: "#fffdf8" },
+    });
+    // Defer scrollToContent so updateScene flushes first; otherwise bounds are stale.
+    requestAnimationFrame(() => {
+      api.scrollToContent(newElements, {
+        animate: true,
+        fitToContent: true,
+        viewportZoomFactor: 0.85,
+      });
+    });
+
+    let frame = 1;
+    const step = () => {
+      const progress = frame / CINEMATIC_TWEEN_FRAMES;
+      api.updateScene({ elements: sceneFor(progress) });
+      if (frame < CINEMATIC_TWEEN_FRAMES) {
+        frame += 1;
+        cinematicTweenRef.current = setTimeout(step, CINEMATIC_TWEEN_FRAME_MS);
+      } else {
+        cinematicTweenRef.current = null;
+      }
+    };
+    cinematicTweenRef.current = setTimeout(step, CINEMATIC_TWEEN_FRAME_MS);
   }
 
   function applyWhiteboardViewportCommand(command) {
@@ -905,6 +1060,29 @@ function App() {
             setExpandedRow(expandedRow === "agent" ? null : "agent"),
           editor: settings
             ? React.createElement(AgentEditor, {
+                settings,
+                onSave: async (patch) => {
+                  await saveSettings(patch);
+                  setExpandedRow(null);
+                },
+                onCancel: () => setExpandedRow(null),
+              })
+            : null,
+        }),
+        statusRow({
+          dotState: "active",
+          label: "Style",
+          value: settings
+            ? `${PRESENTATION_PALETTES[settings.presentation?.palette]?.label ?? "Auto"}` +
+              `${settings.presentation?.cinematicMode === false ? " · static" : " · cinematic"}`
+            : "loading...",
+          expanded: expandedRow === "presentation",
+          onToggle: () =>
+            setExpandedRow(
+              expandedRow === "presentation" ? null : "presentation",
+            ),
+          editor: settings
+            ? React.createElement(PresentationEditor, {
                 settings,
                 onSave: async (patch) => {
                   await saveSettings(patch);
@@ -1643,6 +1821,80 @@ function TranscriptionEditor({ settings, onSave, onCancel }) {
       React.createElement(
         "button",
         { onClick: submit, disabled: busy || needsOpenAIKey },
+        busy ? "Saving..." : "Save",
+      ),
+    ),
+  );
+}
+
+function PresentationEditor({ settings, onSave, onCancel }) {
+  const current = settings.presentation ?? {};
+  const [cinematicMode, setCinematicMode] = React.useState(
+    current.cinematicMode !== false,
+  );
+  const [palette, setPalette] = React.useState(current.palette || "modern");
+  const [fontFamily, setFontFamily] = React.useState(
+    current.fontFamily || "Virgil",
+  );
+  const [busy, setBusy] = React.useState(false);
+  const [errorText, setErrorText] = React.useState("");
+
+  async function submit() {
+    setBusy(true);
+    setErrorText("");
+    try {
+      await onSave({
+        presentation: { cinematicMode, palette, fontFamily },
+      });
+    } catch (error) {
+      setErrorText(error.message);
+      setBusy(false);
+    }
+  }
+
+  return React.createElement(
+    "div",
+    { className: "editor-grid" },
+    field(
+      "Cinematic mode",
+      React.createElement(
+        "label",
+        { className: "field-toggle" },
+        React.createElement("input", {
+          type: "checkbox",
+          checked: cinematicMode,
+          onChange: (e) => setCinematicMode(e.target.checked),
+          disabled: busy,
+        }),
+        React.createElement(
+          "span",
+          { className: "field-toggle-hint" },
+          "Smoothly pan + zoom to new elements as they appear.",
+        ),
+      ),
+    ),
+    field(
+      "Palette",
+      labeledSelect(palette, setPalette, PRESENTATION_PALETTE_OPTIONS, busy),
+    ),
+    field(
+      "Font",
+      labeledSelect(fontFamily, setFontFamily, PRESENTATION_FONT_OPTIONS, busy),
+    ),
+    errorText
+      ? React.createElement("div", { className: "editor-error" }, errorText)
+      : null,
+    React.createElement(
+      "div",
+      { className: "editor-actions" },
+      React.createElement(
+        "button",
+        { className: "secondary", onClick: onCancel, disabled: busy },
+        "Cancel",
+      ),
+      React.createElement(
+        "button",
+        { onClick: submit, disabled: busy },
         busy ? "Saving..." : "Save",
       ),
     ),
