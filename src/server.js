@@ -363,20 +363,16 @@ export async function runWhiteboardAgent({ transcript, state, wss, options, gene
     transcript,
   });
   const whiteboardElementSchema = z.record(z.string(), z.any());
+  // Append-only edit model: the agent can only ADD new elements. Existing
+  // elements on the canvas are permanent — replacing or deleting them was
+  // causing constant rewrites that distracted the audience and burst-drew
+  // big sets of corrections instead of streaming visuals as the talk grows.
+  // The agent must commit to whatever it draws and live with it.
   const editOperationSchema = z.discriminatedUnion("type", [
-    z.object({
-      type: z.literal("replace"),
-      line: z.number().int().positive().describe("Current 1-based line number to replace."),
-      element: whiteboardElementSchema.describe("Replacement drawing object for this line."),
-    }),
     z.object({
       type: z.literal("insert_after"),
       line: z.number().int().min(0).describe("Current line number to insert after. Use 0 to insert at the start."),
       element: whiteboardElementSchema.describe("Drawing object to insert after this line."),
-    }),
-    z.object({
-      type: z.literal("delete"),
-      line: z.number().int().positive().describe("Current 1-based line number to delete."),
     }),
   ]);
 
@@ -408,19 +404,26 @@ export async function runWhiteboardAgent({ transcript, state, wss, options, gene
     messages,
     tools: {
       whiteboard_overwrite: tool({
-        description: "Replace the entire whiteboard with a complete drawing object array. Use only for clearing, resetting, or starting fresh.",
+        description: "DEPRECATED IN APPEND-ONLY MODE. Only valid when the canvas is empty (first turn). Any subsequent call will be rejected — use whiteboard_apply with insert_after instead.",
         inputSchema: z.object({
           elements: z.array(whiteboardElementSchema).describe("Complete replacement drawing object array."),
         }),
         execute: async ({ elements }) => {
           if (!mySession.active) return STALE_SESSION_TOOL_RESULT;
+          // Append-only enforcement: refuse to overwrite once the canvas has
+          // any content. Returning a clear error (instead of silently doing
+          // nothing) lets the model self-correct on retry rather than thinking
+          // the call succeeded.
+          if (state.elements.length > 0) {
+            const msg = "whiteboard_overwrite is forbidden in append-only mode (canvas already has content). Use whiteboard_apply with insert_after to add new elements; existing elements stay as they are.";
+            dumpToolCall("whiteboard_overwrite-rejected", { elementCount: elements.length }, state.elements.map((el) => el.id), msg);
+            return msg;
+          }
           options.onAgentEvent?.({ type: "tool:start", tool: "whiteboard_overwrite", input: { elements }, timestamp: new Date().toISOString() });
           const normalizedElements = normalizeWhiteboardElements(elements);
           state.elements = normalizedElements;
           state.canvasDirtyForAgent = true;
           broadcast(wss, { type: "whiteboard:update", elements: normalizedElements });
-          // The audience now sees agent output for this turn; the queue must
-          // not cancel us anymore (no starvation under continuous speech).
           options.onRendered?.();
           const result = appendLayoutWarnings(formatLineNumberedWhiteboard(normalizedElements), normalizedElements);
           dumpToolCall("whiteboard_overwrite", { elementCount: elements.length, ids: elements.map((el) => el.id) }, normalizedElements.map((el) => el.id), result);
@@ -982,13 +985,19 @@ You listen to transcript chunks and maintain a visual presentation that compleme
 The transcript may contain slight inaccuracies, especially for names, product terms, and short phrases.
 Use surrounding context and prior turns to take your best guess at what the speaker really means instead of copying suspicious wording literally.
 
-Turn boundaries are heuristic, not semantic. A turn may be cut mid-thought when the speaker keeps talking past a word/time cap, and the rest of the sentence will arrive in the next turn. Treat each turn as a draft that the next turn may refine. Concretely:
-- ON EVERY TURN that contains real speech (anything beyond fillers like "uh"/"um"/"o sea"), you MUST call whiteboard_apply or whiteboard_overwrite at least once. Returning DONE without a tool call is forbidden unless the entire turn was filler. Short turn? Add one tentative element with the speaker's literal words as a label. Ambiguous turn? Add a placeholder you'll refine next turn. Long turn? Restructure as needed. NEVER zero-draw a real turn — the audience is watching a blank canvas.
-- The FIRST turn after Start Preso is especially important: the audience just clicked Start and expects immediate visual feedback. Even a single rectangle with the speaker's first sentence inside it is the right move on turn 1.
-- When a later turn extends or corrects the previous one, REVISE THE LAST ELEMENT YOU JUST ADDED — usually only its label or shape — rather than reorganizing the rest of the canvas. Touch the smallest scope that fixes the misunderstanding. The previous turn's commit was YOUR draft to refine, not earlier accepted content.
-- Anything the user already saw stay on screen for more than one turn is "accepted": leave it alone unless the speaker explicitly contradicts it. No silent regroupings, no recoloring of older shapes, no swapping of layouts that were already there.
-- Names, numbers, and outcomes that arrive piecemeal should be merged into the same single element across turns, not stacked as separate elements per turn.
-- The speaker did not split their thought into turns - we did. Reconstruct the underlying intent across the LAST turn or two, but treat older content as settled.
+APPEND-ONLY canvas. THIS IS THE MOST IMPORTANT RULE.
+- Once you put an element on the canvas, IT IS PERMANENT. Whatever shape it has, whatever label it carries, whatever color — it stays exactly as you drew it for the rest of the talk. The audience already saw it.
+- The ONLY operation available is insert_after: ADD new elements next to existing ones. Replace and delete do not exist.
+- Do NOT try to "fix" a previous element. Do NOT regroup, recolor, or relabel. Do NOT call whiteboard_overwrite (it's blocked once the canvas has content).
+- If a previous element ended up wrong (typo, misheard word, awkward layout), TOO BAD — leave it. The next element you add will provide the correct version, and the audience will read both. Audiences are forgiving of small errors; they are NOT forgiving of constant rewrites that erase what they were just looking at.
+- Plan each addition like a sentence in a stream-of-consciousness essay: it commits forever the moment you put it down.
+
+Turn boundaries are heuristic, not semantic. A turn may be cut mid-thought when the speaker keeps talking past a word/time cap, and the rest of the sentence will arrive in the next turn:
+- ON EVERY TURN that contains real speech (anything beyond fillers like "uh"/"um"/"o sea"), you MUST call whiteboard_apply with at least one insert_after operation. Returning DONE without an insert is forbidden unless the entire turn was filler.
+- The FIRST turn after Start Preso draws the canvas's first element — the audience just clicked Start and expects immediate visual feedback.
+- Short turn? Add one small element capturing the gist. Ambiguous turn? Add a tentative element; the next turn will add the correction NEXT to it (not over it). The audience reading both is fine. Long turn? Add multiple elements in one call.
+- Names, numbers, and outcomes that arrive piecemeal? You can NOT merge them into one element across turns (no edit). Just add the next piece next to the previous one. Use proximity, an arrow, or a column layout to convey the relationship.
+- The speaker did not split their thought into turns — we did. The agent's job is to draw NEW things as new content arrives, not to re-edit the past.
 There are two kinds of useful input.
 
 1. Visual notes: durable talking points, relationships, decisions, contrasts, and flows.
