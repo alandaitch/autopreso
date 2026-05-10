@@ -114,6 +114,51 @@ test("committed without prior mid-utterance flush queues the full text once", as
   assert.deepEqual(queued, ["a b c d"]);
 });
 
+test("sentence-boundary flush: a partial ending in '.' fires immediately, no quiet wait", async () => {
+  // The point of this signal: while the speaker keeps talking, Moonshine puts
+  // a period in the partial as soon as it predicts an utterance ended (well
+  // before its own commit fires on real silence). We flush right then so the
+  // canvas updates DURING the talk, not at the trailing pause.
+  const { stdout, queued } = mkTranscription({
+    moonshinePartialQuietMs: 9999,    // make the quiet timer effectively never fire
+    moonshineMaxPartialWords: 999,
+    moonshineMaxPartialMs: 999_999,
+  });
+  stdout.emit("data", Buffer.from('{"type":"transcript:partial","text":"hello world."}\n'));
+  await Promise.resolve();
+  // No quiet wait, no caps — boundary detection alone should have flushed it.
+  assert.deepEqual(queued, ["hello world."]);
+});
+
+test("sentence-boundary flush: '?' and '!' also count as strong terminals", async () => {
+  for (const trailing of ["?", "!"]) {
+    const { stdout, queued } = mkTranscription({
+      moonshinePartialQuietMs: 9999,
+      moonshineMaxPartialWords: 999,
+      moonshineMaxPartialMs: 999_999,
+    });
+    stdout.emit("data", Buffer.from(JSON.stringify({ type: "transcript:partial", text: `is this on${trailing}` }) + "\n"));
+    await Promise.resolve();
+    assert.deepEqual(queued, [`is this on${trailing}`], `failed for trailing ${trailing}`);
+  }
+});
+
+test("clause boundary flush: a comma after enough words fires; a comma early on does NOT", async () => {
+  // "hello, world" — only 2 words before the comma → don't flush yet.
+  const { stdout, queued } = mkTranscription({
+    moonshinePartialQuietMs: 9999,
+    moonshineMaxPartialWords: 999,
+    moonshineMaxPartialMs: 999_999,
+  });
+  stdout.emit("data", Buffer.from('{"type":"transcript:partial","text":"hello,"}\n'));
+  await Promise.resolve();
+  assert.deepEqual(queued, [], "short clause should not have flushed");
+  // Same partial grown to a 6+ word clause ending in comma → flush.
+  stdout.emit("data", Buffer.from('{"type":"transcript:partial","text":"on the topic of cost and price,"}\n'));
+  await Promise.resolve();
+  assert.deepEqual(queued, ["on the topic of cost and price,"]);
+});
+
 test("Moonshine that diverges from the flushed prefix falls back to emitting full text", async () => {
   const { stdout, queued } = mkTranscription({
     moonshinePartialQuietMs: 5000,

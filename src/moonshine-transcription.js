@@ -4,18 +4,25 @@ import path from "node:path";
 
 const require = createRequire(import.meta.url);
 const SAMPLE_RATE = 24000;
-// If the rolling partial transcript hasn't grown for this long, treat it as
-// a turn even if Moonshine itself hasn't emitted `transcript:committed` yet.
-// 1000ms is roughly the natural inter-utterance pause and matches OpenAI
-// Realtime's delta-quiet default. Lower values cause too-frequent micro-turns
-// that the model can't draw on; higher values delay the first visual.
-const DEFAULT_PARTIAL_QUIET_MS = 1000;
-// Continuous speech caps. Each chunk should carry enough words for the model
-// to confidently extract a concept and draw it. 18 words ≈ 4-6 seconds of
-// natural speech — a full sentence or two, enough to commit to a layout.
-// 6s is the upper bound: even speakers who never pause get a visual every 6s.
-const DEFAULT_MAX_PARTIAL_WORDS = 18;
-const DEFAULT_MAX_PARTIAL_MS = 6000;
+// Quiet-timer fallback: flush the partial as a turn if it hasn't grown for
+// this long. Moonshine itself does sentence segmentation on natural pauses,
+// but during continuous speech it never commits, and we want visual feedback
+// to keep up with the speaker, not wait for them to stop. 500ms is shorter
+// than a typical sentence-end pause (~700-1000ms) so we flush BEFORE the model
+// commits, not after.
+const DEFAULT_PARTIAL_QUIET_MS = 500;
+// Continuous-speech caps: under nonstop speech (no pauses, no punctuation),
+// flush every ~12 words (~3 seconds) to keep visuals streaming.
+const DEFAULT_MAX_PARTIAL_WORDS = 12;
+const DEFAULT_MAX_PARTIAL_MS = 3500;
+// Sentence-boundary flush: Moonshine puts a period/question mark/exclamation
+// in the partial AS SOON as it predicts an utterance ended, often before its
+// own internal commit fires. Treat that as an immediate flush signal — that's
+// the natural beat of speech, far better than waiting on quiet/time caps.
+// Trailing comma after enough words is also a strong clause boundary.
+const STRONG_TERMINAL = /[.!?]"?\)?\s*$/;
+const CLAUSE_TERMINAL = /,\s*$/;
+const CLAUSE_MIN_WORDS = 6;
 const SIDECAR_PACKAGE_BY_PLATFORM = new Map([
   ["darwin:arm64", "@autopreso/moonshine-darwin-arm64"],
   ["darwin:x64", "@autopreso/moonshine-darwin-x64"],
@@ -107,6 +114,21 @@ export function createMoonshineTranscription({
     return false;
   }
 
+  // Sentence-boundary detection. Returns true if the partial just landed on a
+  // natural break — strong terminal (./!/?) or a clause-ending comma after
+  // enough words. Either signal means the speaker just finished a thought; we
+  // can flush immediately rather than waiting on quiet/cap timers.
+  function partialEndsAtBoundary(text) {
+    const trimmed = text.trimEnd();
+    if (!trimmed) return false;
+    if (STRONG_TERMINAL.test(trimmed)) return true;
+    if (CLAUSE_TERMINAL.test(trimmed)) {
+      const words = trimmed.split(/\s+/).filter(Boolean).length;
+      if (words >= CLAUSE_MIN_WORDS) return true;
+    }
+    return false;
+  }
+
   function scheduleQuietFlush() {
     cancelQuietTimer();
     if (partialQuietMs <= 0) return;
@@ -171,12 +193,20 @@ export function createMoonshineTranscription({
               cancelQuietTimer();
               return;
             }
-            // Cap: continuous speech with no pause should still produce frequent
-            // turns so the canvas updates while the speaker keeps talking.
+            // 1) Strongest signal: Moonshine just placed a sentence/clause
+            // terminator in the partial. Flush immediately — that's the
+            // speaker's natural beat, far better than waiting on timers.
+            if (partialEndsAtBoundary(text)) {
+              flushPartialAsTurn();
+              return;
+            }
+            // 2) Hard caps: continuous speech with no punctuation should still
+            // produce frequent turns so the canvas updates while talking.
             if (partialExceededCaps(text)) {
               flushPartialAsTurn();
               return;
             }
+            // 3) Quiet timer: shortest natural pause within an utterance.
             scheduleQuietFlush();
           },
           onCommitted: (text) => {
