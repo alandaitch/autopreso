@@ -31,6 +31,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
     // loaded when text first appears. Other fonts (Virgil/Helvetica/Cascadia)
     // are fetched on demand and flash with a serif fallback while loading.
     fontFamily: "Excalifont",
+    // Output rendering mode. "whiteboard" = Excalidraw free-form canvas that
+    // grows with the talk (legacy behavior). "slides" = one full-canvas slide
+    // at a time, big icon + headline; the agent edits the current slide or
+    // emits a new one when topic changes. The agent uses a different system
+    // prompt + tool set per mode (see slidesSystemPrompt in server.js).
+    layoutMode: "whiteboard",
   },
   apiKeys: {
     openai: "",

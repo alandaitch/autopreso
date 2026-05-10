@@ -49,6 +49,15 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
   const state = {
     mode: "staging",
     elements: seedElements(),
+    // Current slide for "slides" layoutMode. Null when no slide has been
+    // emitted yet (or in whiteboard mode). Shape: { headline, subtitle?,
+    // icon?, layout: "hero"|"split"|"quote", index } - validated server-side
+    // by zod schemas in server.js.
+    currentSlide: null,
+    // Monotonic counter for slide ordering. Bumps every time slide_set creates
+    // a fresh slide (not on slide_edit). Lets the frontend tell apart "edit
+    // current slide" from "transition to a new slide".
+    slideIndex: 0,
     agentHistory: [],
     agentStatus: "idle",
     agentBusy: false,
@@ -192,6 +201,8 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
   state.reset = () => {
     state.endSession();
     state.elements = seedElements();
+    state.currentSlide = null;
+    state.slideIndex = 0;
     state.agentHistory = [];
     state.latestScreenshot = undefined;
     state.cost.reset();
@@ -200,6 +211,8 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
     state.endSession();
     state.mode = "live";
     state.elements = seedElements();
+    state.currentSlide = null;
+    state.slideIndex = 0;
     state.latestScreenshot = undefined;
     state.agentHistory = [primerMessage];
     state.agentInstructions = typeof agentInstructions === "string" ? agentInstructions : "";

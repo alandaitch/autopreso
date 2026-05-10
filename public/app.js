@@ -251,6 +251,12 @@ function App() {
   });
   const [agentInstructions, setAgentInstructionsValue] = React.useState("");
   const [cost, setCost] = React.useState(null);
+  // Current slide for "slides" layoutMode. null = no slide yet (or in
+  // whiteboard mode). The previousSlide ref lets the overlay tell when the
+  // slide INDEX changed so it can run the slide-from-right transition; pure
+  // field edits (slide_edit) don't bump the index and crossfade in place.
+  const [currentSlide, setCurrentSlide] = React.useState(null);
+  const previousSlideIndexRef = React.useRef(0);
   const audioSessionRef = React.useRef(null);
   const apiRef = React.useRef(null);
   const settingsRef = React.useRef(null);
@@ -469,6 +475,9 @@ function App() {
           Array.isArray(message.elements) &&
           message.elements.length <= STARTER_ELEMENTS.length + 1;
         applyScene(message.elements, { recenter: isFreshStarter });
+      }
+      if (message.type === "slide:update") {
+        setCurrentSlide(message.slide ?? null);
       }
       if (message.type === "whiteboard:viewport")
         applyWhiteboardViewportCommand(message);

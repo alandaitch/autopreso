@@ -23,6 +23,7 @@ import { broadcast, createWhiteboardSession } from "./whiteboard-session.js";
 import { detectMalformedLayoutWarnings, normalizeWhiteboardElements } from "./whiteboard-elements.js";
 import { extractWhiteboardKeywords } from "./whiteboard-keywords.js";
 import { applyWhiteboardEditOperations, formatLineNumberedWhiteboard } from "./whiteboard-tools.js";
+import { applySlideEdit, buildSlide, formatSlideForAgent, SLIDE_LAYOUTS } from "./slide-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -73,6 +74,7 @@ export async function startServer(options) {
     state.reset();
     transcription.setSessionContext({ keywords: [] });
     broadcast(wss, { type: "whiteboard:update", elements: state.elements });
+    broadcast(wss, { type: "slide:update", slide: state.currentSlide });
     broadcastCost(wss, state);
     res.json({ ok: true });
   });
@@ -122,6 +124,7 @@ export async function startServer(options) {
     });
     broadcast(wss, { type: "mode", mode: state.mode });
     broadcast(wss, { type: "whiteboard:update", elements: state.elements });
+    broadcast(wss, { type: "slide:update", slide: state.currentSlide });
     broadcastCost(wss, state);
     res.json({ ok: true });
   });
@@ -167,6 +170,9 @@ export async function startServer(options) {
     client.send(JSON.stringify({ type: "cost", ...state.cost.getSummary() }));
     if (state.mode === "live") {
       client.send(JSON.stringify({ type: "whiteboard:update", elements: state.elements }));
+      if (state.currentSlide) {
+        client.send(JSON.stringify({ type: "slide:update", slide: state.currentSlide }));
+      }
     }
 
     client.on("message", async (raw) => {
@@ -343,6 +349,10 @@ async function createTranscriptionManager({ options, wss, queueTranscript, state
 }
 
 export async function runWhiteboardAgent({ transcript, state, wss, options, generateTextFn = generateText, streamTextFn = streamText }) {
+  const layoutMode = await resolveLayoutMode(options);
+  if (layoutMode === "slides") {
+    return runSlidesAgent({ transcript, state, wss, options, generateTextFn, streamTextFn });
+  }
   // Capture the session at turn start. If the user clicks Stop / Back to
   // staging / Reset / Start preso while we're in flight, mySession.active
   // flips to false. Tool execute and the post-turn agentHistory update both
@@ -523,6 +533,133 @@ export async function runWhiteboardAgent({ transcript, state, wss, options, gene
   // runTurn finally{}, regardless of whether this call succeeded, was cancelled,
   // or errored. That guarantees the next turn always has the prior speech as
   // context even when its agent invocation never completed.
+  return result;
+}
+
+// Resolve the active layoutMode ("whiteboard" | "slides") from options or the
+// settings store. Falls back to "whiteboard" so anything that doesn't pass
+// settings (tests, scaffolds) keeps the legacy behavior.
+export async function resolveLayoutMode(options) {
+  if (options?.layoutMode === "slides" || options?.layoutMode === "whiteboard") {
+    return options.layoutMode;
+  }
+  if (options?.settingsStore) {
+    try {
+      const settings = await options.settingsStore.load();
+      const mode = settings?.presentation?.layoutMode;
+      if (mode === "slides" || mode === "whiteboard") return mode;
+    } catch {
+      // Fall through to default below.
+    }
+  }
+  return "whiteboard";
+}
+
+// Slides-mode agent loop. Mirrors runWhiteboardAgent's session/abort handling
+// and cache-aware messaging, but exposes a different tool surface (slide_set
+// + slide_edit) and a slides-specific system prompt. The current slide is
+// stored on state.currentSlide; tool calls broadcast slide:update over WS.
+export async function runSlidesAgent({ transcript, state, wss, options, generateTextFn = generateText, streamTextFn = streamText }) {
+  const mySession = state.session ?? { active: true };
+  const rawMessages = buildSlidesAgentMessages({
+    currentSlide: state.currentSlide,
+    agentHistory: state.agentHistory,
+    transcript,
+  });
+
+  const slideLayoutEnum = z.enum(SLIDE_LAYOUTS);
+  const slideSetSchema = z.object({
+    headline: z.string().min(1).max(140).describe("Short headline for the slide, 5-12 words. Big visual focus."),
+    subtitle: z.string().max(160).optional().describe("Optional one-line subtitle. Keep it short (<= 12 words)."),
+    icon: z.string().optional().describe("Optional Lucide icon name in kebab-case (e.g. 'lightbulb', 'rocket', 'chart-bar'). Skip when no icon adds meaning."),
+    layout: slideLayoutEnum.describe("'hero' = icon centered above headline, 'split' = icon left + headline right, 'quote' = large headline only."),
+  });
+  const slideEditSchema = z.object({
+    field: z.enum(["headline", "subtitle", "icon", "layout"]).describe("Which field of the current slide to mutate."),
+    value: z.string().describe("New value for the field. Pass an empty string to clear subtitle/icon. For 'layout' must be one of: hero, split, quote."),
+  });
+
+  const baseSystem = slidesSystemPrompt();
+  const agentProvider = options.agentProvider
+    ?? (options.settingsStore
+      ? resolveAgentProviderFromSettings({ settings: await options.settingsStore.load(), env: options.env ?? process.env })
+      : defaultWhiteboardAgentProvider(options));
+  const primerText = extractPrimerText(state.agentHistory?.[0]);
+  const effectiveSystem = buildEffectiveSystemPrompt(baseSystem, primerText, state.agentInstructions);
+  const messages = primerText ? reshapeMessagesForCodex(rawMessages) : rawMessages;
+  options.onAgentEvent?.({ type: "model:start", transcript, system: effectiveSystem, messages, timestamp: new Date().toISOString() });
+  const codexInstructions = agentProvider.provider === "codex" ? effectiveSystem : null;
+  dumpAgentRequest("slides-turn", { system: effectiveSystem, messages, instructions: codexInstructions, primerText });
+
+  const broadcastSlide = () => broadcast(wss, { type: "slide:update", slide: state.currentSlide });
+
+  const agentCallOptions = {
+    model: createWhiteboardAgentModel(agentProvider),
+    providerOptions: createWhiteboardAgentProviderOptions(agentProvider, effectiveSystem),
+    stopWhen: stepCountIs(3),
+    abortSignal: options.abortSignal,
+    system: effectiveSystem,
+    messages,
+    tools: {
+      slide_set: tool({
+        description: "Replace the current slide with a brand-new one. Use when the speaker has clearly moved to a new topic or when no slide exists yet. Triggers a slide transition (crossfade / slide-from-right) on the audience screen.",
+        inputSchema: slideSetSchema,
+        execute: async (input) => {
+          if (!mySession.active) return STALE_SESSION_TOOL_RESULT;
+          options.onAgentEvent?.({ type: "tool:start", tool: "slide_set", input, timestamp: new Date().toISOString() });
+          state.slideIndex = (state.slideIndex ?? 0) + 1;
+          const next = buildSlide(input, state.slideIndex);
+          state.currentSlide = next;
+          state.canvasDirtyForAgent = true;
+          broadcastSlide();
+          options.onRendered?.();
+          const result = `Slide #${next.index} is now live:\n${formatSlideForAgent(next)}`;
+          dumpToolCall("slide_set", input, [], result);
+          options.onAgentEvent?.({ type: "tool:end", tool: "slide_set", result, slide: next, timestamp: new Date().toISOString() });
+          return result;
+        },
+      }),
+      slide_edit: tool({
+        description: "Mutate ONE field of the current slide in place (no transition). Use when the speaker is still on the same topic and you only want to refine the headline, subtitle, icon, or layout. Returns an error if there is no current slide yet — call slide_set first in that case.",
+        inputSchema: slideEditSchema,
+        execute: async (input) => {
+          if (!mySession.active) return STALE_SESSION_TOOL_RESULT;
+          options.onAgentEvent?.({ type: "tool:start", tool: "slide_edit", input, timestamp: new Date().toISOString() });
+          if (!state.currentSlide) {
+            const msg = "slide_edit: there is no current slide yet. Call slide_set first to create one.";
+            dumpToolCall("slide_edit", input, [], msg);
+            return msg;
+          }
+          const next = applySlideEdit(state.currentSlide, input);
+          state.currentSlide = next;
+          state.canvasDirtyForAgent = true;
+          broadcastSlide();
+          options.onRendered?.();
+          const result = `Slide #${next.index} (edited):\n${formatSlideForAgent(next)}`;
+          dumpToolCall("slide_edit", input, [], result);
+          options.onAgentEvent?.({ type: "tool:end", tool: "slide_edit", result, slide: next, timestamp: new Date().toISOString() });
+          return result;
+        },
+      }),
+    },
+  };
+
+  const result = await withTimeout(
+    runWhiteboardAgentGeneration(agentProvider, agentCallOptions, { generateTextFn, streamTextFn }),
+    options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
+    "Slides agent timed out",
+  );
+  options.onModelReturned?.();
+  logAgentUsage("slides-turn", result, {
+    transcript: transcript?.slice(0, 80),
+    fingerprints: {
+      system: fingerprint(effectiveSystem),
+      primer: fingerprint(state.agentHistory[0]),
+      tools: fingerprint(toolDefinitionFingerprintInput(agentCallOptions.tools)),
+    },
+  });
+  recordAgentCost(state, wss, agentProvider, result);
+  options.onAgentEvent?.({ type: "model:end", transcript, result: summarizeAgentResult(result), timestamp: new Date().toISOString() });
   return result;
 }
 
@@ -918,6 +1055,18 @@ export function buildWhiteboardAgentMessages({ agentHistory, elements, latestScr
   ];
 }
 
+export function buildSlidesAgentMessages({ agentHistory, currentSlide, transcript }) {
+  return [
+    ...agentHistory,
+    { role: "user", content: formatSpeakerTurn(transcript) },
+    { role: "user", content: formatCurrentSlideTask(currentSlide) },
+  ];
+}
+
+function formatCurrentSlideTask(currentSlide) {
+  return `Current slide:\n${formatSlideForAgent(currentSlide)}\n\nTask:\nDecide whether the speaker has just moved to a NEW topic (call slide_set to replace the current slide) or is still on the SAME topic and just refining (call slide_edit on one field, or do nothing if the slide is already accurate). Topic boundaries are usually obvious: a new statistic, a different example, a contrasting idea, an explicit "next" or "now let's...". When in doubt on the very first turn, call slide_set so the audience sees something. Never call both tools in the same turn — pick one.`;
+}
+
 export function appendWhiteboardAgentHistory(agentHistory, { transcript }) {
   const nextHistory = [...agentHistory];
   const transcriptText = transcript.trim();
@@ -1187,4 +1336,44 @@ Examples:
 {"type":"rectangle","id":"node-1","x":100,"y":100,"width":220,"height":80,"backgroundColor":"#a5d8ff","fillStyle":"solid","roundness":{"type":3},"label":{"text":"Main idea","fontSize":18}}
 {"type":"arrow","id":"edge-1","x":320,"y":140,"width":160,"height":0,"points":[[0,0],[160,0]],"endArrowhead":"arrow","label":{"text":"leads to","fontSize":14}}
 {"type":"text","id":"title","x":100,"y":40,"text":"Live Talking Points","fontSize":24}`;
+}
+
+export function slidesSystemPrompt() {
+  return `You are AutoPreso (slides mode), a real-time presentation agent.
+
+You listen to transcript chunks and drive a slideshow. ONE slide is visible at a time, full-screen, and your job is to keep that slide in sync with what the speaker is saying right now.
+
+Output style:
+- Each slide carries a SHORT headline (5-12 words), an OPTIONAL one-line subtitle (<= 12 words), an OPTIONAL Lucide icon, and a layout: "hero" (icon centered above headline), "split" (icon left, headline right), or "quote" (large headline only).
+- Slides are big and visual. Headlines are punchy and concrete: a claim, a metric, a name, a contrast - NOT a sentence transcribed from the speaker.
+- Pick "hero" by default. Use "split" when the slide pairs an icon with a longer-feeling headline. Use "quote" for emphatic statements where an icon would feel decorative.
+
+Transcript handling:
+- Turn boundaries are heuristic; treat each turn as a draft the next turn may refine.
+- If there is no slide yet OR the speaker has clearly moved to a NEW topic, call slide_set to replace the current slide. This triggers a transition (crossfade / slide-from-right) on the audience screen.
+- If the speaker is still on the SAME topic and you only need to refine wording, change the icon, or switch layout, call slide_edit on the single field that changed. Do NOT call slide_set for small refinements - it would jarringly re-transition.
+- If the current slide already captures the moment, return DONE without calling any tool.
+- On the very first turn after Start Preso, ALWAYS call slide_set. The audience just clicked Start and expects an immediate first slide.
+- Topic boundaries are usually signaled by: a new statistic, a different example, an explicit "next/now/let's", or a contrast that the prior slide doesn't fit anymore.
+
+Icons:
+- Use Lucide kebab-case names: "lightbulb", "rocket", "brain", "chart-bar", "trending-up", "shield", "users", "target", "sparkles", "zap", "trophy", "calendar", "code", "globe", "dollar-sign", "lock", etc.
+- The icon should reinforce the headline's meaning at a glance. Skip the icon ("layout":"quote" or simply omit it on hero/split) when nothing fits cleanly.
+- One icon per slide. No emoji.
+
+Tool contract:
+- slide_set replaces the whole slide. Required: headline, layout. Optional: subtitle, icon.
+- slide_edit mutates ONE field (headline | subtitle | icon | layout) on the current slide. Pass empty string to clear subtitle/icon.
+- One tool call per turn. After the tool returns, respond with exactly DONE - do not summarize.
+
+Reference context:
+- A "Reference context for this presentation" section in your system instructions contains material the user prepared. Pull headline wording, terms, and named concepts from it when the speaker reaches the relevant topic, instead of paraphrasing.
+- Don't dump the entire reference context up front. Surface relevant pieces as the speaker brings them up.
+
+Forbidden:
+- Long paragraph headlines.
+- Multiple slides per turn (no batching).
+- Restating the speaker's whole sentence verbatim - condense to a punchy idea.
+- Calling slide_set for tiny refinements (use slide_edit).
+- Emojis in headlines.`;
 }
